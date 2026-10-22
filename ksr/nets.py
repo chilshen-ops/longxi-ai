@@ -281,7 +281,10 @@ class Router(nn.Module):
         p_mean = probs.mean(dim=(0, 1))
         aux = self.n_exp * torch.sum(f * p_mean)
         return {"expert_ids": top_i, "expert_weights": weights, "confidence": confidence,
-                "need_knowledge": need, "aux_loss": aux}
+                "need_knowledge": need, "aux_loss": aux,
+                # 原始 logits 要暴露出来：路由的领域监督（oracle 蒸馏）要用它算交叉熵。
+                # 只给 top-k 的 id 和权重的话，监督信号进不来。
+                "logits": logits}
 
 
 # ── 序列级纠错器（单份，请求级触发）────────────────────────────────────────────
@@ -383,7 +386,8 @@ class KSRModel(nn.Module):
     def forward(self, input_ids: torch.Tensor, cache: Optional[CacheList] = None,
                 start_pos: int = 0, force_expert: Optional[int] = None) -> Tuple[torch.Tensor, Dict]:
         h = self.embed(input_ids) * self.embed_scale
-        meta: Dict = {"confidence": [], "need_knowledge": [], "expert_ids": [], "aux_loss": 0.0}
+        meta: Dict = {"confidence": [], "need_knowledge": [], "expert_ids": [],
+                      "router_logits": [], "aux_loss": 0.0}
         last_reasoner = None
         for i, blk in enumerate(self.blocks):
             slot = cache[i] if cache is not None else None
@@ -391,6 +395,7 @@ class KSRModel(nn.Module):
             meta["confidence"].append(route["confidence"])
             meta["need_knowledge"].append(route["need_knowledge"])
             meta["expert_ids"].append(route["expert_ids"])
+            meta["router_logits"].append(route["logits"])
             meta["aux_loss"] = meta["aux_loss"] + route["aux_loss"]
         meta["aux_loss"] = meta["aux_loss"] / max(1, self.cfg.num_layers)
         meta["final_hidden"] = h

@@ -51,5 +51,6 @@
   "kb_max_total_tokens": 96,
   "router_confidence_low": 0.35,
   "aux_loss_weight": 0.01,
+  "router_supervision_weight": 0.5,
   "limits": {}
 }

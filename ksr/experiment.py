@@ -195,6 +195,9 @@ DOMAIN_SPEC = {
 SERVICES = [f"svc{i:02d}" for i in range(24)]
 DOMAINS = list(DOMAIN_SPEC)
 ANSWERS = [a for spec in DOMAIN_SPEC.values() for _, a in spec["items"]]
+# 路由监督的靶：一个领域固定对应一个专家。这是"oracle 蒸馏"式的监督信号——
+# 没有它，路由器只看到"答对就行"，而答对不需要分工，于是它塌回均匀。
+DOM_TO_EXPERT = {d: i for i, d in enumerate(DOMAINS)}
 
 
 def build_corpus() -> Dict:
@@ -304,6 +307,23 @@ def train_model(model: KSRModel, tok: CharTokenizer, corpus: Dict, steps=900, bs
         loss = F.cross_entropy(logits[:, :-1].reshape(-1, model.cfg.vocab_size),
                                Y[:, 1:].reshape(-1), ignore_index=-100)
         loss = loss + model.cfg.aux_loss_weight * meta["aux_loss"]
+        w_sup = getattr(model.cfg, "router_supervision_weight", 0.0)
+        if w_sup > 0:
+            # 路由监督：每个领域固定对应一个专家，在"预测第一个答案 token"的那个位置
+            # 监督每一层的路由。fact 类样本没有技能靶，用 -1 忽略。
+            tgt = torch.full((X.shape[0],), -1, dtype=torch.long)
+            for i, (_, _, dom) in enumerate(batch):
+                tgt[i] = DOM_TO_EXPERT.get(dom, -1)
+            keep = tgt >= 0
+            if bool(keep.any()):
+                bidx = keep.nonzero(as_tuple=True)[0]
+                pos = ((Y != -100).float().argmax(dim=1) - 1)[keep].clamp(min=0)
+                rl = torch.stack(meta["router_logits"])[:, bidx]          # [L,Bk,S,E]
+                gather_i = pos.view(1, -1, 1, 1).expand(rl.shape[0], -1, 1, rl.shape[-1])
+                rl = rl.gather(2, gather_i).squeeze(2)                    # [L,Bk,E]
+                target = tgt[bidx].unsqueeze(0).expand(rl.shape[0], -1)   # 每层同一个靶
+                loss = loss + w_sup * F.cross_entropy(
+                    rl.reshape(-1, rl.shape[-1]), target.reshape(-1))
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

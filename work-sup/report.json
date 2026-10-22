@@ -1,0 +1,92 @@
+{
+  "assignment": {
+    "windows": 0,
+    "linux": 1,
+    "hardware": 9,
+    "physics": 3,
+    "chemistry": 4,
+    "network": 5,
+    "database": 6,
+    "container": 7,
+    "k8s": 8,
+    "git": 9,
+    "python": 10,
+    "rust": 0,
+    "medical": 12,
+    "legal": 8,
+    "finance": 8,
+    "chess": 8
+  },
+  "routed": {
+    "acc": 0.59375,
+    "n": 32,
+    "zero_domains": [
+      "legal",
+      "rust"
+    ]
+  },
+  "dense_single_expert": {
+    "acc": 0.59375,
+    "n": 32,
+    "zero_domains": [
+      "legal",
+      "rust"
+    ]
+  },
+  "skill_forced_wrong_no_fix": {
+    "acc": 0.625,
+    "avg_forwards": 1.0,
+    "n": 32
+  },
+  "skill_forced_wrong_fixed": {
+    "acc": 0.59375,
+    "avg_forwards": 2.5625,
+    "n": 32
+  },
+  "natural_routing": {
+    "naive": 0.59375,
+    "policy": 0.59375,
+    "levels": {
+      "L1": 19,
+      "L0": 13
+    },
+    "avg_forwards": 1.75,
+    "n": 32
+  },
+  "fact_kb_on": {
+    "acc": 0.8333333333333334,
+    "n": 24,
+    "retrieval_hit": 1.0,
+    "avg_injected_tokens": 28.0,
+    "budget_total": 96
+  },
+  "fact_kb_off": {
+    "acc": 0.0,
+    "n": 24
+  },
+  "throughput_dense": 26281.983020929612,
+  "throughput_ksr": 6546.729823798779,
+  "dense_params": 4292864,
+  "ksr_params": 4292362,
+  "dense_ffn": 2288,
+  "evolution_l1": {
+    "port": 9000,
+    "before": "72MHz",
+    "after": "svc16",
+    "gold": "svc16"
+  },
+  "l2_consolidation": {
+    "port": 9001,
+    "before": "72MHz",
+    "after": "168MHz",
+    "gold": "svc17",
+    "expert": 1,
+    "finetune": {
+      "loss_first": 6.4582037925720215,
+      "loss_last": 1.9687834978103638,
+      "trainable_params": 196608
+    },
+    "retention_before": 0.8333333333333334,
+    "retention_after": 0.8333333333333334
+  }
+}

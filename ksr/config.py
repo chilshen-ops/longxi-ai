@@ -64,6 +64,10 @@ class KSRConfig:
     router_confidence_high: float = 0.85
     general_expert: int = 0          # 常识兜底通路（低置信时只走它）
     aux_loss_weight: float = 0.01
+    # 路由监督（oracle 蒸馏）权重：把"这个领域该走哪个专家"直接教给路由器。
+    # 只靠交叉熵 + 负载均衡时，交叉熵一收敛，辅助损失就主导梯度并把路由按回均匀
+    # （实测置信度 0.062 ≈ 1/16，专家等于被乘了个接近零的系数）。0 表示不监督。
+    router_supervision_weight: float = 0.0
 
     def __post_init__(self):
         if isinstance(self.linear_attn, dict):
