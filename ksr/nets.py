@@ -330,17 +330,24 @@ class KSRBlock(nn.Module):
         ids, w = route["expert_ids"], route["expert_weights"]
         b, s, k = ids.shape
         expert_out = torch.zeros_like(x)
-        for slot in range(k):
-            for eid in range(experts.cfg.num_skill_experts):
-                target = force_expert if force_expert is not None else eid
-                if target != eid:
-                    continue
-                mask = (ids[:, :, slot] == eid)
-                if not mask.any():
-                    continue
-                sel = self.expert_norm(x)[mask]                          # [N,H] 一次性批量算
-                out = experts.pool[eid][self.layer_index - 1](sel)       # 整栈中的第 layer 片
-                expert_out[mask] += out * w[mask, slot].unsqueeze(-1)
+        if force_expert is not None:
+            # 强制走某一个专家：不看路由选的是谁。
+            # 原来这里只在"路由恰好选中 eid"的位置上套 target，于是 target 与路由不一致时
+            # 一个专家都没用上——测出来的"选错专家"其实是"完全不用专家"，
+            # 而 L2 微调则因为专家压根没进计算图而报 "does not require grad"。
+            # 权重仍沿用路由给的分，保证强制路径和普通路径的量级可比。
+            sel = self.expert_norm(x)
+            out = experts.pool[force_expert][self.layer_index - 1](sel)
+            expert_out = out * w.sum(-1, keepdim=True)
+        else:
+            for slot in range(k):
+                for eid in range(experts.cfg.num_skill_experts):
+                    mask = (ids[:, :, slot] == eid)
+                    if not mask.any():
+                        continue
+                    sel = self.expert_norm(x)[mask]                        # [N,H] 一次性批量算
+                    out = experts.pool[eid][self.layer_index - 1](sel)     # 整栈中的第 layer 片
+                    expert_out[mask] += out * w[mask, slot].unsqueeze(-1)
         x = x + expert_out
         return x, route, reasoner_out
 
@@ -351,6 +358,11 @@ class KSRModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        # tied embedding 若用 PyTorch 默认初始化（std=1），logits 数量级会到 sqrt(h) 以上，
+        # 初始 loss 直接飙到 200+（正常应约 ln(V)≈6），训练又慢又不稳。
+        # 按 GPT-2 的做法：权重 std=0.02，输入侧再乘 sqrt(h) 把信号补回来，输出 logits 保持小数量级。
+        self.embed.weight.data.normal_(mean=0.0, std=0.02)
+        self.embed_scale = float(cfg.hidden_size) ** 0.5
         self.blocks = nn.ModuleList([KSRBlock(cfg, i + 1) for i in range(cfg.num_layers)])
         self.norm = RMSNorm(cfg.hidden_size)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
@@ -364,19 +376,13 @@ class KSRModel(nn.Module):
     # 输出投影的计算量与权重是否绑定无关（绑定省字节，不省矩阵乘）
     def activated_params(self) -> int:
         c = self.cfg
-        per_layer = 0
-        for blk in self.blocks:
-            per_layer += sum(p.numel() for p in blk.attn.parameters())
-            per_layer += sum(p.numel() for p in blk.router.parameters())
-            per_layer += sum(p.numel() for p in blk.reasoner.parameters())
-            per_layer += sum(p.numel() for p in blk.expert_norm.parameters())
+        per_layer = sum(sum(p.numel() for p in blk.parameters()) for blk in self.blocks)
         active_expert = sum(p.numel() for p in self.experts.pool[0].parameters()) * c.top_k_experts
-        return (per_layer + active_expert + c.vocab_size * c.hidden_size
-                + sum(p.numel() for p in self.norm.parameters()))
+        return per_layer + active_expert + c.vocab_size * c.hidden_size + c.hidden_size
 
     def forward(self, input_ids: torch.Tensor, cache: Optional[CacheList] = None,
                 start_pos: int = 0, force_expert: Optional[int] = None) -> Tuple[torch.Tensor, Dict]:
-        h = self.embed(input_ids)
+        h = self.embed(input_ids) * self.embed_scale
         meta: Dict = {"confidence": [], "need_knowledge": [], "expert_ids": [], "aux_loss": 0.0}
         last_reasoner = None
         for i, blk in enumerate(self.blocks):

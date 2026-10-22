@@ -61,6 +61,8 @@ class KSRConfig:
     kb_max_total_tokens: int = 128
     # 路由
     router_confidence_low: float = 0.35
+    router_confidence_high: float = 0.85
+    general_expert: int = 0          # 常识兜底通路（低置信时只走它）
     aux_loss_weight: float = 0.01
 
     def __post_init__(self):
@@ -91,9 +93,9 @@ class KSRConfig:
     @classmethod
     def from_json(cls, path: str | Path) -> "KSRConfig":
         data: Dict[str, Any] = json.loads(Path(path).read_text("utf-8"))
-        data.pop("_note", None)
-        data.pop("limits", None)
-        data.pop("link", None)
+        # 只有计算器用的字段，模型侧忽略（其余未知字段必须报错，防止拼错的规格被静默吞掉）
+        for key in ("_note", "limits", "link", "runtime_overhead_bytes"):
+            data.pop(key, None)
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         unknown = set(data) - known
         if unknown:

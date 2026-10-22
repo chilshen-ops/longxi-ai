@@ -1,3 +1,13 @@
 .venv-lib/
 __pycache__/
 *.pyc
+
+# 实验产物：训练检查点、向量侧车、日志（合计 50MB+，用 python -m ksr.experiment 可重新生成）
+work/
+work-scaled/
+work-smoke/
+work-smoke2/
+work-smoke3/
+work-starved/
+*.pt
+*.npy

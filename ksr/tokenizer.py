@@ -21,6 +21,7 @@ class CharTokenizer:
     def __init__(self, vocab: Iterable[str] = (), extra_tokens: Iterable[str] = ()):
         self.token2id: Dict[str, int] = {}
         self.id2token: Dict[str, str] = {}
+        self.max_token_len = 1          # 贪心最长匹配的搜索上限
         for t in SPECIALS:
             self._add(t)
         # 字节回退槽位固定放在特殊 token 之后，保证跨语料稳定
@@ -40,6 +41,7 @@ class CharTokenizer:
         if token not in self.token2id:
             self.token2id[token] = len(self.token2id)
             self.id2token[len(self.token2id) - 1] = token
+            self.max_token_len = max(self.max_token_len, len(token))
         return self.token2id[token]
 
     @property
@@ -74,19 +76,44 @@ class CharTokenizer:
 
     # ── 编解码 ──────────────────────────────────────────────────────────
     def encode(self, text: str, add_special: bool = False) -> List[int]:
+        """贪心最长匹配。
+
+        逐字符编码有个致命问题：词表里的多字符条目（命令名、服务名）永远编不出来，
+        它们只是占着 id 的死词条。后果是答案被拆成 5-7 个字符，生成端必须逐字抄对，
+        评测就会假性失败——看起来像"模型不行"，其实是编码器的锅。
+        """
         ids: List[int] = []
         if add_special:
             ids.append(self.bos_id)
-        for ch in text:
-            tok = self.token2id.get(ch)
-            if tok is None:  # 字节回退：任何字符都能表示
-                for byte in ch.encode("utf-8"):
-                    ids.append(self.token2id[_BYTE_PREFIX % byte])
+        i, n = 0, len(text)
+        while i < n:
+            for size in range(min(self.max_token_len, n - i), 1, -1):
+                seg = text[i:i + size]
+                tok = self.token2id.get(seg)
+                if tok is not None:
+                    ids.append(tok)
+                    i += size
+                    break
             else:
-                ids.append(tok)
+                ch = text[i]
+                tok = self.token2id.get(ch)
+                if tok is None:  # 字节回退：任何字符都能表示
+                    for byte in ch.encode("utf-8"):
+                        ids.append(self.token2id[_BYTE_PREFIX % byte])
+                else:
+                    ids.append(tok)
+                i += 1
         if add_special:
             ids.append(self.eos_id)
         return ids
+
+    def encode_prompt(self, text: str) -> List[int]:
+        """推理侧的提示词编码：前缀必须和训练侧一模一样。
+
+        训练时序列以 BOS 开头、推理时不加，RoPE 位置就整体错一格。模型记的是绝对位置，
+        于是训练 loss 很低、评测却接近随机——这种落差一定要用同一条编码路径堵死。
+        """
+        return [self.bos_id] + self.encode(text)
 
     def encode_query(self, text: str) -> List[int]:
         return self.encode(text, add_special=False)

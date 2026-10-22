@@ -76,9 +76,9 @@ def lowrank_params(h: int, rank: int, kind: str = "swiglu") -> int:
     return ffn_params(kind, h, rank)
 
 
-def router_params(h: int, hidden: int, num_experts: int, num_heads: int = 2) -> int:
-    """轻量门控：h->hidden->(专家 logits + 若干标量头)。"""
-    return h * hidden + hidden * (num_experts + num_heads)
+def router_params(h: int, hidden: int, num_experts: int) -> int:
+    """h→hidden→(专家 logits) + 一个 need_knowledge 头（含 bias）。与 ksr/nets.py 逐项对应。"""
+    return h * hidden + hidden * num_experts + hidden + 1
 
 
 def corrector_params(h: int, hidden: int, classes: int, with_correction_proj: bool) -> int:
@@ -112,10 +112,12 @@ def analyze(cfg: dict) -> dict:
     lin_dk = lin.get("head_dim_k", hd)
     lin_dv = lin.get("head_dim_v", hd)
     lin_heads = lin.get("num_v_heads", heads)
+    # 衰减门 + 写入门（含 bias），与 ksr/nets.py 的 GatedDeltaNet 逐项对应
+    lin_gates = 2 * (h * lin_heads + lin_heads)
 
     # --- 参数分解 ---
     p_attn_full = attn_proj_params(h, heads, kg, hd) * n_full
-    p_attn_lin = attn_proj_params(h, lin_heads, lin_kg, lin_dv) * n_lin
+    p_attn_lin = (attn_proj_params(h, lin_heads, lin_kg, lin_dv) + lin_gates) * n_lin
     p_attn = p_attn_full + p_attn_lin
 
     ffn_kind = cfg["ffn_type"]
@@ -142,7 +144,7 @@ def analyze(cfg: dict) -> dict:
 
     p_embed = V * h
     p_head = 0 if cfg.get("tied_embeddings", True) else V * h
-    p_norms = 2 * h * (L + 1)  # RMSNorm 权重，占比可忽略但计入
+    p_norms = h * (3 * L + 1)  # 每层 attn/reasoner/expert 三个 RMSNorm + 末尾一个（与 ksr/nets.py 一致）
 
     total = (p_attn + p_reasoner + p_experts_pool + p_router + p_corrector
              + p_embed + p_head + p_norms)
@@ -313,10 +315,10 @@ def render(cfg: dict, res: dict) -> str:
       f"{bB(p['attention_full']/max(L['full_attn'],1))} | GQA，K/V 共享投影 |")
     w(f"| Attention（线性 {L['linear_attn']} 层） | {bB(p['attention_linear'])} | "
       f"{bB(p['attention_linear']/max(L['linear_attn'],1))} | 投影预算与 GQA 层相同 |")
-    w(f"| 常识专家（常驻） | {bB(p['reasoner'])} | {bB(p['reasoner']/L)} | 每层都激活 |")
+    w(f"| 常识专家（常驻） | {bB(p['reasoner'])} | {bB(p['reasoner']/L['total'])} | 每层都激活 |")
     w(f"| 技能专家池（{cfg['num_skill_experts']} 个） | {bB(p['experts_pool'])} | "
-      f"{bB(p['experts_pool']/L)} | 单专家单层 {bB(p['experts_unit'])} |")
-    w(f"| 路由 | {bB(p['router'])} | {bB(p['router']/L)} | 轻量门控 |")
+      f"{bB(p['experts_pool']/L['total'])} | 单专家单层 {bB(p['experts_unit'])} |")
+    w(f"| 路由 | {bB(p['router'])} | {bB(p['router']/L['total'])} | 轻量门控 |")
     w(f"| 纠错器 | {bB(p['corrector'])} | — | "
       f"{cfg.get('corrector',{}).get('placement','n/a')} |")
     w(f"| Embedding + LM Head | {bB(p['embedding']+p['lm_head'])} | — | "
@@ -332,7 +334,7 @@ def render(cfg: dict, res: dict) -> str:
     w(f"| 投影矩阵乘 / token | {gf(f['proj_per_token'])} |")
     w(f"| Prefill（{ctx} tokens，整段） | {gf(f['prefill_total'])} |")
     w(f"| Decode / token（{ctx} 上下文） | {gf(f['decode_per_token'])} |")
-    w(f"| 注意力 O(n²) 项 / 同深度稠密 | {f['attn_ratio']*100:.1f}% |")
+    w(f"| 注意力额外算力 / 同深度稠密 | {f['attn_ratio_vs_dense_same_depth']*100:.1f}% |")
     w("")
 
     w("### 3. 显存（推理常驻）\n")
@@ -398,7 +400,8 @@ def selfcheck() -> int:
     p = r["params"]
     # 逐项手算期望值
     exp = {
-        "attention": 37_748_736 * 24,                      # 905,969,664
+        # 6 个全注意力层 + 18 个线性层（线性层多两个门控投影）
+        "attention": 6 * 37_748_736 + 18 * (37_748_736 + 2 * (4096 * 32 + 32)),
         "reasoner": 12_582_912 * 24,                       # 301,989,888
         "experts_pool": 6_291_456 * 16 * 24,               # 2,415,919,104
         "experts_active_hand": 6_291_456 * 24,             # 150,994,944

@@ -1,0 +1,105 @@
+{
+  "assignment": {
+    "windows": 4,
+    "linux": 8,
+    "hardware": 1,
+    "physics": 2,
+    "chemistry": 7,
+    "network": 4,
+    "database": 7,
+    "container": 4,
+    "k8s": 3,
+    "git": 8,
+    "python": 2,
+    "rust": 2,
+    "medical": 4,
+    "legal": 1,
+    "finance": 2,
+    "chess": 1
+  },
+  "routed": {
+    "acc": 0.3125,
+    "n": 32,
+    "zero_domains": [
+      "chemistry",
+      "chess",
+      "database",
+      "finance",
+      "legal",
+      "medical",
+      "network",
+      "physics",
+      "python"
+    ]
+  },
+  "dense_single_expert": {
+    "acc": 0.3125,
+    "n": 32,
+    "zero_domains": [
+      "chemistry",
+      "chess",
+      "database",
+      "finance",
+      "legal",
+      "medical",
+      "network",
+      "physics",
+      "python"
+    ]
+  },
+  "skill_forced_wrong_no_fix": {
+    "acc": 0.3125,
+    "avg_forwards": 1.0,
+    "n": 32
+  },
+  "skill_forced_wrong_fixed": {
+    "acc": 0.3125,
+    "avg_forwards": 3.4375,
+    "n": 32
+  },
+  "natural_routing": {
+    "naive": 0.3125,
+    "policy": 0.3125,
+    "levels": {
+      "L2": 32
+    },
+    "avg_forwards": 1.0,
+    "n": 32
+  },
+  "fact_kb_on": {
+    "acc": 0.6666666666666666,
+    "n": 24,
+    "retrieval_hit": 1.0,
+    "avg_injected_tokens": 28.0,
+    "budget_total": 96
+  },
+  "fact_kb_off": {
+    "acc": 0.041666666666666664,
+    "n": 24
+  },
+  "throughput_dense": 23261.643354870524,
+  "throughput_ksr": 4862.05592873317,
+  "dense_params": 4292864,
+  "ksr_params": 4292362,
+  "dense_ffn": 2288,
+  "evolution_l1": {
+    "port": 9000,
+    "before": "svc19",
+    "after": "svc19",
+    "gold": "svc16"
+  },
+  "l2_consolidation": {
+    "port": 9001,
+    "before": "svc19",
+    "after": "svc19",
+    "gold": "svc17",
+    "expert": 2,
+    "finetune": {
+      "loss_first": 8.954453468322754,
+      "loss_last": 2.248850107192993,
+      "trainable_params": 196608
+    },
+    "retention_before": 0.6666666666666666,
+    "retention_after": 0.6666666666666666
+  }
+}

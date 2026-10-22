@@ -1,6 +1,6 @@
 {
   "name": "KSR-MoE-7B 定稿（32 层 + 全 MHA，坐实 7B 标签；r=512）",
-  "_note": "口径：注意力与标准 7B 完全一致（32 层 × 全 MHA × 2.15B），差别只在 FFN 被替换为『常识专家常驻 + 低秩技能专家旁路』。8 层保留全注意力（4k+1），24 层用线性注意力（状态恒定，不随长度增长）。",
+  "_note": "口径：注意力与标准 7B 完全一致（32 层 × 全 MHA × 2.15B），差别只在 FFN 被替换为『常识专家常驻 + 低秩技能专家旁路』。8 层保留全注意力（4k+1），24 层用线性注意力（状态恒定，不随长度增长）。常识专家按已确认的需求取 w=2048：它既要参与所有回答（每层共享 FFN），也要在路由不确定时独立兜底作答，w=1024 只够粗筛。",
   "vocab_size": 131072,
   "hidden_size": 4096,
   "num_layers": 32,
@@ -15,7 +15,7 @@
     "head_dim_v": 128
   },
   "ffn_type": "swiglu",
-  "reasoner_hidden": 1024,
+  "reasoner_hidden": 2048,
   "num_skill_experts": 16,
   "expert_rank": 512,
   "expert_ffn_type": "swiglu",
@@ -45,8 +45,8 @@
   "runtime_overhead_bytes": 1000000000,
   "limits": {
     "max_total_params": 7500000000,
-    "max_activated_params": 3600000000,
-    "max_resident_gib": 16,
+    "max_activated_params": 4000000000,
+    "max_resident_gib": 18,
     "max_expert_pool_params": 5000000000
   }
 }
