@@ -1,0 +1,51 @@
+{
+  "name": "KSR-MoE 7B 备选档（填满 7B 预算：r=1024）",
+  "vocab_size": 131072,
+  "hidden_size": 4096,
+  "num_layers": 24,
+  "num_attention_heads": 32,
+  "num_kv_groups": 4,
+  "head_dim": 128,
+  "full_attn_layers": [1, 5, 9, 13, 17, 21],
+  "linear_attn": {
+    "num_kv_groups": 4,
+    "num_v_heads": 32,
+    "head_dim_k": 128,
+    "head_dim_v": 128
+  },
+  "ffn_type": "swiglu",
+  "reasoner_hidden": 1024,
+  "num_skill_experts": 16,
+  "expert_rank": 1024,
+  "expert_ffn_type": "swiglu",
+  "top_k_experts": 1,
+  "router_hidden": 512,
+  "corrector": {
+    "enabled": true,
+    "placement": "sequence",
+    "hidden": 4096,
+    "num_classes": 3,
+    "with_correction_proj": true,
+    "always_on": false
+  },
+  "tied_embeddings": true,
+  "context_len": 32768,
+  "quant": {
+    "attention": "bf16",
+    "reasoner": "bf16",
+    "router": "int8g64",
+    "experts": "int4g32",
+    "embedding": "bf16",
+    "kv_cache": "bf16",
+    "corrector": "bf16"
+  },
+  "hot_experts": 16,
+  "link": { "bandwidth_gbps": 56.0 },
+  "runtime_overhead_bytes": 1000000000,
+  "limits": {
+    "max_total_params": 7500000000,
+    "max_activated_params": 2400000000,
+    "max_resident_gib": 14,
+    "max_expert_pool_params": 5200000000
+  }
+}
