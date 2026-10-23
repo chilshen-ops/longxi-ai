@@ -57,7 +57,12 @@ def resolve_cfg_path(state: dict) -> str:
     """
     if "--config" in sys.argv:
         return sys.argv[sys.argv.index("--config") + 1]
-    return (state.get("cfg_path") or os.environ.get("KSR_CONFIG") or str(CFG_DEFAULT))
+    saved = state.get("cfg_path")
+    # 检查点里记的是训练那台机器上的绝对路径，换一台就不存在了——这种情况要往下回退，
+    # 否则从 GitHub 上 clone 下来直接跑会报一个"文件不存在"的错误，而不是好好回退到默认配置。
+    if saved and os.path.exists(saved):
+        return saved
+    return os.environ.get("KSR_CONFIG") or str(CFG_DEFAULT)
 
 
 def _zero_experts_handles(model):

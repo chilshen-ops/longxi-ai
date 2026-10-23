@@ -14,4 +14,12 @@ work-starved/
 .venv-gpu/
 .dl/
 work-*/
+# 例外：演示台要用的那个原型（8.5 MB）。没有它，别人 clone 下来 tools/play.py 跑不起来。
+# 顺序不能调：先排除所有 work-*，再单独放行 work-conflict 这个目录本身，
+# 然后排除它的内容，最后只把三个小文件放回来——被排除的目录里没法直接放行文件。
+!work-conflict/
+work-conflict/*
+!work-conflict/model.pt
+!work-conflict/report.json
+!work-conflict/attrib.json
 *.log

@@ -1,0 +1,29 @@
+{
+  "work": "A:\\default-workspace\\ksr-moe\\work-conflict",
+  "eval_skill_n": 32,
+  "ci95_halfwidth": 0.1764,
+  "skill_acc_all_on": 0.5625,
+  "skill_acc_experts_off": 0.5625,
+  "skill_acc_shared_ffn_off": 0.0312,
+  "skill_acc_embedding_attention_only": 0.0,
+  "gap_experts": 0.0,
+  "gap_shared_ffn": 0.5312,
+  "fact_acc_kb_on": 0.9167,
+  "fact_acc_kb_off": 0.0417,
+  "gap_kb": 0.875,
+  "fact_retrieval_hit": 1.0,
+  "fact_acc_upper_bound_handwritten": 0.9167,
+  "presentation_gap": 0.0,
+  "facts_also_in_weights": 1,
+  "facts_conflicting_with_kb": 21,
+  "prior_wrong_on_held_facts": 23,
+  "evidence_reliance": 0.913,
+  "evidence_makes_it_worse": 0,
+  "kb_size": 128,
+  "verdicts": [
+    "EXPERTS_EMPTY：专家清零不影响任何答案——本次训练没有产生专家知识，任何关于动态 MoE（驻留/数量）的结论都不成立",
+    "KB_CARRIES_FACTS：事实题 检索开 92% / 检索关 4%，这些知识确实在知识库",
+    "PRIOR_CONFLICTS_WITH_KB：21 条事实模型自己给了一个错的服务名，KB 里是另一个——同一条知识有两个权威来源，更新 KB 未必生效",
+    "IN_WEIGHTS_TOO：1 条事实不用检索也答对，KB 与权重同时持有"
+  ]
+}
