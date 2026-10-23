@@ -48,7 +48,9 @@ SYSTEM = ("你是一个助手，有 calc、kb_add、kb_lookup 三个工具。"
           "用户说「记一下」「记住」时调用 kb_add 写进外部知识库；"
           "用户问一个可能是他以前说过的事实时调用 kb_lookup 去查，"
           "查到了照知识库答，没查到就说没查到；任何算术都调用 calc，不要心算。"
-          "要调用工具就直接输出工具调用，不要用自己的话代替它。回答要简短。")
+          "要调用工具就直接输出工具调用，不要用自己的话代替它。"
+          "用户让你改写、翻译、润色、解释一段文本时，那是任务不是知识，不要用任何工具。"
+          "回答要简短。")
 
 TOOLS = [
     {"type": "function", "function": {
@@ -58,15 +60,19 @@ TOOLS = [
             "required": ["expr"]}}},
     {"type": "function", "function": {
         "name": "kb_add",
-        "description": "把一条新知识写进外部知识库。写进去不用重新训练，以后问到就能查到。"
-                       "用户告诉你一个新事实（他的生日、项目的部署机器、某个人的偏好）时调用。",
+        "description": "把一条新知识写进外部知识库，以后问到就能查到。"
+                       "**只用于用户在告诉你一个关于他自己、他的人或他的项目的持久事实**"
+                       "（他的工号、他家的猫生日、项目的部署机器、团队的约定）。"
+                       "用户让你改写、翻译、润色、解释、计算一段文本时，那段文本不是要记的事实，"
+                       "不要调用这个工具，直接做他要的处理。",
         "parameters": {"type": "object", "properties": {
             "text": {"type": "string", "description": "要记住的完整一句话，包含主语"},
             "answer": {"type": "string", "description": "这条知识里最关键的那个值（可选）"}},
             "required": ["text"]}}},
     {"type": "function", "function": {
-        "name": "kb_lookup", "description": "到外部知识库里查一条事实。不确定又像是用户"
-                       "以前说过的，就查，不要凭印象答。",
+        "name": "kb_lookup", "description": "到外部知识库里查一条事实。"
+                       "**只在答案依赖用户私有的信息时才查**（他的工号、他的项目、他说过的事）。"
+                       "通用知识（什么是 HTTP、谁是谁、单位换算）你自己就知道，直接回答，不要查。",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "要查的问题或关键词"}},
             "required": ["query"]}}},
@@ -298,7 +304,8 @@ def auto_context(question: str) -> tuple[str, list[dict]]:
     return "\n".join(f"【已知】{r['text']}" for r in results), results
 
 
-def chat(messages: list[dict], think: bool = False, max_steps: int = 4) -> dict:
+def chat(messages: list[dict], think: bool = False, max_steps: int = 4,
+         auto: bool = True) -> dict:
     """一轮对话。模型可能连着调几次工具，最后才给回答。
 
     工具结果**以 user 身份**包在 <tool_response>…
@@ -308,7 +315,8 @@ def chat(messages: list[dict], think: bool = False, max_steps: int = 4) -> dict:
     tok = CTX["tok"]
     question = next((str(m.get("content", "")) for m in reversed(messages)
                      if m.get("role") == "user"), "")
-    ctx, hits = auto_context(question)
+    # auto=False 就是"只靠模型自己调工具"那条路，用来分开测两条路各自的命中率
+    ctx, hits = auto_context(question) if auto else ("", [])
     sys_prompt, steps = SYSTEM, []
     if ctx:
         sys_prompt += "\n\n知识库里查到的、已确认的信息，回答时以它为准：\n" + ctx
