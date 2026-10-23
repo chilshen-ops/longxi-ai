@@ -139,6 +139,35 @@ def test_generate_runs_with_forced_expert():
     assert len(forced) == 3
 
 
+def test_paging_capacity_is_enforced_during_forward():
+    """动态驻留的容量必须真的封顶——前向不能把热集合撑回"全部专家"。
+
+    这条守的是一个真实犯过的错：enable_paging 只设了初始热集合、没设 cfg.hot_experts，
+    于是 ensure_hot 的换出判据还是"装得下就加"，跑一轮下来 hot 又长回全部专家，
+    峰值显存一点没降、搬运全落在预热阶段（稳态计数为 0）——看起来像"动态驻留没用"，
+    其实是容量根本没生效。
+    """
+    model, cfg = _model()
+    store = model.experts
+    store.enable_paging(torch.device("cpu"), hot=[0], capacity=1)
+    assert store.cfg.hot_experts == 1, "容量没有写进 cfg，换出判据还是旧值"
+    assert store.hot == [0]
+    ids = torch.randint(4, cfg.vocab_size, (1, 24))
+    with torch.no_grad():
+        model(ids)                                       # 前向会按需 ensure_hot
+    assert len(store.hot) <= 1, f"热集合被前向撑回 {len(store.hot)} 个：{store.hot}"
+    assert store.resident_bytes <= store.stack_bytes * 1 * 4 + 1, "常驻字节统计没跟着封顶"
+
+
+def test_stack_bytes_is_one_full_stack_not_layers_again():
+    """stack_bytes = 一个专家整栈的参数量。pool[0] 本身就含每层一片，不能再乘层数。"""
+    model, cfg = _model()
+    store = model.experts
+    per_stack = sum(p.numel() for p in store.pool[0].parameters())
+    assert store.stack_bytes == per_stack, (
+        f"stack_bytes={store.stack_bytes} 而一个栈是 {per_stack}，层数被乘了两遍")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

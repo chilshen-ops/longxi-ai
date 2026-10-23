@@ -56,6 +56,10 @@ class VectorIndex:
         self.dim = dim
         self.records: List[KnowledgeRecord] = []
         self.vectors = np.zeros((0, dim), dtype=np.float32)
+        # 符号倒排：编号/标识符 → 含它的行号。稠密召回受候选池限制，稀疏召回不受，
+        # 所以库涨到几万条也不会把正确条目挤出候选。不落盘——从 records 就能重建，
+        # 省掉一份会不同步的副本。
+        self.inverted: Dict[str, List[int]] = {}
 
     def add(self, rec: KnowledgeRecord, emb: Sequence[float]) -> None:
         v = np.asarray(emb, dtype=np.float32).reshape(-1)
@@ -65,6 +69,26 @@ class VectorIndex:
             v = v / norm
         self.records.append(rec)
         self.vectors = np.concatenate([self.vectors, v[None]], axis=0)
+        row = len(self.records) - 1
+        for key in _key_tokens(rec.text):
+            self.inverted.setdefault(key, []).append(row)
+
+    def remove(self, rid: str) -> bool:
+        """按 rid 删一条，并重建符号倒排。
+
+        为什么要有：改一条知识必须先能撤掉旧的。curator 的否决、R4 说的"重复权威"消歧，
+        都要求库里对同一个事实最多只有一条——否则模型会自己挑一条，更新就不生效。
+        实现上整表重灌（add 会顺手把倒排建好、向量再归一一次是无害的），这个规模无所谓。
+        """
+        if not any(r.rid == rid for r in self.records):
+            return False
+        keep = [(r, v) for r, v in zip(self.records, self.vectors) if r.rid != rid]
+        self.records = []
+        self.vectors = np.zeros((0, self.dim), dtype=np.float32)
+        self.inverted = {}
+        for rec, vec in keep:
+            self.add(rec, vec)
+        return True
 
     def search(self, q: Sequence[float], top_k: int) -> List[Tuple[float, KnowledgeRecord]]:
         if not self.records:
@@ -76,6 +100,21 @@ class VectorIndex:
         sims = self.vectors @ (qv / n)
         order = np.argsort(-sims)[: max(0, top_k)]
         return [(float(sims[i]), self.records[i]) for i in order if self.records[i] is not None]
+
+    def search_keys(self, qkeys: set, limit: int) -> List[Tuple[float, KnowledgeRecord]]:
+        """符号通路：查询里出现的编号，直接查到含它的条目。
+
+        不看相似度、也不受候选池大小影响，所以库涨到几万条命中率也不会掉。
+        命中几个符号就算几分，和词面加分同一量纲，交给同一个重排去比。
+        """
+        if not qkeys or limit <= 0:
+            return []
+        hits: Dict[int, int] = {}
+        for key in qkeys:
+            for row in self.inverted.get(key, ()):
+                hits[row] = hits.get(row, 0) + 1
+        ranked = sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+        return [(float(n), self.records[row]) for row, n in ranked]
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,6 +133,9 @@ class VectorIndex:
                 if line.strip():
                     idx.records.append(KnowledgeRecord.from_dict(json.loads(line)))
         assert len(idx.records) == idx.vectors.shape[0], "记录与向量行数不一致"
+        for row, rec in enumerate(idx.records):          # 倒排从 records 重建
+            for key in _key_tokens(rec.text):
+                idx.inverted.setdefault(key, []).append(row)
         return idx
 
     def __len__(self) -> int:
@@ -110,6 +152,9 @@ class Segment:
 
 class KnowledgeBase:
     """SSD 上的多领域知识库。检索必须受预算约束——这是"低硬件"能否成立的关键。"""
+
+    # 暴力全库扫的召回上限。超过这个规模就不该再靠扫全库兜底，必须换 faiss 或符号倒排。
+    SCAN_CAP = 4096
 
     def __init__(self, root: str | Path, dim: int):
         self.root = Path(root)
@@ -129,6 +174,25 @@ class KnowledgeBase:
         idx.add(rec, emb)
         idx.save(self.root / f"{domain}.jsonl")
 
+    def remove(self, domain: str, rid: str) -> bool:
+        """删一条并落盘（jsonl 和向量侧车一起重写，行序保持一致）。"""
+        idx = self.indices.get(domain)
+        if idx is None or not idx.remove(rid):
+            return False
+        idx.save(self.root / f"{domain}.jsonl")
+        return True
+
+    def find(self, needle: str, domain: str = "") -> List[Tuple[str, KnowledgeRecord]]:
+        """按正文包含关系定位条目，返回 (领域, 记录)。给"改一条知识"找 rid 用。"""
+        domains = [domain] if domain else self.domains()
+        hits: List[Tuple[str, KnowledgeRecord]] = []
+        for dom in domains:
+            idx = self.indices.get(dom)
+            if idx is None:
+                continue
+            hits.extend((dom, r) for r in idx.records if needle in r.text)
+        return hits
+
     def size(self) -> int:
         return sum(len(v) for v in self.indices.values())
 
@@ -141,30 +205,48 @@ class KnowledgeBase:
                  query_text: str = "", lexical_weight: float = 1.0) -> List[Segment]:
         """按分数取 Top-K，逐段截断到单片上限，累计超过总预算就停。
 
-        打分 = 向量相似度 + 词面关键片段命中。只用向量相似度不够：同一批问题共用一个
-        句式模板，均值池化出来的嵌入几乎一样，留出集实测检索命中率只有 17%。
-        生产环境的检索也都是稀疏+稠密混合——这里把"问题里的编号/ASCII 标识符有没有
-        出现在条目里"作为一个硬信号加进来。
+        召回有**两条通路，缺一不可**（合并去重后统一重排）：
+          * 稠密：向量相似度先多召回再重排。只用向量相似度不够——同一批问题共用句式模板，
+            均值池化出来的嵌入几乎一样，留出集实测只有 17%。
+          * 符号：`_key_tokens` 抽出的编号/标识符走倒排精确命中，**与库规模无关**。
+            只有稠密通路时，正确条目能不能进候选池要看运气：热插 200 条把库从 64 涨到
+            264，命中率就从 100% 掉到 62%、旧题准确率 71%→38%——而模型权重一个字节没变。
+        排序是**两级**的，不是把两路分数加在一起：先按符号命中数降序，再按混合分降序。
+        这条是被测出来的：把"编号精确命中"设计成和 cosine 同量纲的 +1.0 加分，只要条目
+        向量彼此接近（同句式模板就是这样，cosine≈1），精确命中就会和纯相似**打平**，
+        打平就退化成按插入顺序排——符号通路等于白做（2000 条库、池子压到 32 时实测只有
+        5/286 命中）。精确编号命中本来就该压过任何相似度。
 
         返回的 token 总数一定 <= max_total_tokens（测试守着这条）。
         """
         qkeys = _key_tokens(query_text)
-        # 先用向量分数**多召回**（候选池要明显大于 top_k），再用混合分数重排。
-        # 只在 top_k 个向量近克里加词面信号是没用的：正确条目压根进不了前 k 名，
-        # 权重加不到它头上——这就是上一版"加了混合检索但命中率纹丝不动"的原因。
-        pool = max(top_k * 8, 32)
-        cands: List[Tuple[float, KnowledgeRecord]] = []
-        for d in domains:
-            if d not in self.indices:
-                continue
-            for score, rec in self.indices[d].search(query_emb, pool):
-                bonus = lexical_weight if (qkeys & _key_tokens(rec.text)) else 0.0
-                cands.append((score + bonus, rec))
-        cands.sort(key=lambda x: -x[0])
+        # 稠密通路的候选池必须随库规模放大，不能写死。search() 本来就要对整个索引算一遍
+        # 相似度再排序，截断只是把已经算出来的结果扔掉，所以放大池子几乎不增加成本
+        # （实测单条更新 2.3ms→2.7ms）。超过 SCAN_CAP 就不该再靠扫全库，交给 faiss。
+        scope = [d for d in domains if d in self.indices]
+        total = sum(len(self.indices[d]) for d in scope)
+        pool = max(top_k * 8, 32, min(total, self.SCAN_CAP))
+        # rid -> (混合分, 符号命中数, 记录)。两条通路会把同一条目各送一次，不去重就会把
+        # 检索预算占两遍；同一个 rid 取 (符号数, 混合分) 较高的那次。
+        best: Dict[str, Tuple[float, int, KnowledgeRecord]] = {}
+
+        def offer(score: float, rec: KnowledgeRecord, sym: int) -> None:
+            prev = best.get(rec.rid)
+            if prev is None or (sym, score) > (prev[1], prev[0]):
+                best[rec.rid] = (score, sym, rec)
+
+        for d in scope:
+            idx = self.indices[d]
+            for score, rec in idx.search(query_emb, pool):
+                keys = qkeys & _key_tokens(rec.text)
+                offer(score + (lexical_weight if keys else 0.0), rec, len(keys))
+            for n, rec in idx.search_keys(qkeys, pool):
+                offer(n * lexical_weight, rec, n)
+        cands = sorted(best.values(), key=lambda v: (-v[1], -v[0]))
 
         out: List[Segment] = []
         used = 0
-        for score, rec in cands:
+        for score, _sym, rec in cands:
             if len(out) >= top_k or used >= max_total_tokens:
                 break
             text, n = _truncate_to_tokens(rec.text, max_tokens_per_segment, count_tokens)

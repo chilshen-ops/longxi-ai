@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -199,6 +200,91 @@ ANSWERS = [a for spec in DOMAIN_SPEC.values() for _, a in spec["items"]]
 # 没有它，路由器只看到"答对就行"，而答对不需要分工，于是它塌回均匀。
 DOM_TO_EXPERT = {d: i for i, d in enumerate(DOMAINS)}
 
+# ── 上下文的呈现格式：训练侧和检索注入侧必须共用下面这两个函数 ──────────────────
+# 报告第 5 节那条"训练与推理必须共用同一条编码路径"讲的是同一个坑的另一种犯法：
+# 上一轮前缀 token 只在训练侧加，于是 loss 0.014、评测 8%。
+#
+# 热更新实测里"只靠检索 48% vs 手写上下文 59%"那 11 个百分点，2×2 测下来是**两个因素**
+# （库 264 条、rank-1 命中 100%、权重一个字节没动）：
+#     注入 1 条：不加前缀 55%   加【已知】前缀 59%   ← 加前缀就正好等于上界
+#     注入 2 条：不加前缀 50%   加【已知】前缀 45%   ← 两条都标反而最差
+# 所以格式要统一（只有一条带【已知】），而且第二条是纯干扰：模型被要求同时相信两句
+# "已知事实"。这两件事必须一起做，只做任一半都不涨——上一轮就是只做了一半，
+# 结果 48%→45% 反而更差。
+CTX_PREFIX = os.environ.get("KSR_CTX_PREFIX", "【已知】")
+# 注入几条。默认 1 的前提是 rank-1 命中率高——那个数就在主张2/主张6 旁边测着，
+# 一旦掉下来，第一个该调的就是它。
+KB_INJECT_N = int(os.environ.get("KSR_KB_INJECT_N", "1"))
+
+
+def fact_line(port: int, svc: str) -> str:
+    """一条事实在上下文里的写法。知识库里存正文，这里是"给模型看的那一行"。"""
+    return f"{CTX_PREFIX}端口 {port} 的服务是 {svc}"
+
+
+def render_context(segments: Sequence[Segment], n: int | None = None) -> str:
+    """拼上下文：只有排第一的那条带【已知】，其余是不被断言的候选。"""
+    n = KB_INJECT_N if n is None else n
+    picked = list(segments)[: max(0, n)]
+    return "".join(f"{CTX_PREFIX}{s.text}\n" if i == 0 else f"{s.text}\n"
+                   for i, s in enumerate(picked))
+
+
+# 任务规模开关。实测过：这个语料下把 16 个技能专家**全部清零**，三组题的正确率一个都不掉
+# （56%/56%、75%/75%、8%/8%），而不用专家（56%）比走路由（53%）还高——也就是说共享通路
+# 加 tied embedding 把这 160 条映射全背下了，专家根本没参与。没有专家知识，动态 MoE 的
+# 任何机制（驻留、数量）都只是在给一个空架子做机器。
+# 这个开关把每个领域的映射数扩到 N，用来测"专家贡献随任务规模的增长曲线"：只有当共享
+# 通路背不下时，专家才会被迫参与。0 = 用手写的 10 条，行为完全不变。
+INTENTS_PER_DOMAIN = int(os.environ.get("KSR_INTENTS", "0"))
+
+# 冲突改写训练的比例。归属探针测出来：检索命中 100%、呈现格式 gap 0，但**证据优先率只有
+# 73%**——先验答错时模型有四分之一不肯照抄注入的知识条目；而把答案手抄进题面也只有 75%，
+# 和检索开一模一样。所以上限不是检索、不是格式，是模型不认账。
+# 这个开关在训练事实题时按这个比例**故意把上下文里的服务名换成错的**，并且目标也跟着换成
+# 上下文里那个错的。模型于是学到一条规则："【已知】那行写什么就答什么"，而不是"按我背过的答"。
+# 评测时上下文都是对的，所以这条规则只会帮忙不会添乱（实测：先验本来对、被检索带错 0 条）。
+CONFLICT_RATE = float(os.environ.get("KSR_CONFLICT", "0"))
+
+
+def _eval_indices(n_items: int, base_n: int) -> List[int]:
+    """留出评测取哪些映射——都用训练里没出现过的第三种句式，所以测的是句式泛化。
+
+    没扩任务时取原始 10 条里的第 4、9 条，和 docs/REPORT.md 里的历史数字可比。
+    扩了任务必须把留出集一起放大：32 题的留出集分辨不出 6pp 的差距（5 对 vs 3 对就是噪声），
+    而 B1/B2 要测的恰恰是几个百分点级的 gap。所以扩任务后按每 5 条留 1 条。
+    **不同 N 之间的准确率不可比**（留出集不同），只有同一 N 下的 gap 可比。
+    """
+    if n_items <= base_n:
+        return [4, 9]
+    return [i for i in range(4, n_items, 5)]
+
+
+def _extend_items(base: List[Tuple[str, str]], n: int) -> List[Tuple[str, str]]:
+    """把某个领域的映射扩到 n 条：模板复用加编号后缀，**答案只从原有集合里随机指派**。
+
+    两个刻意的约束，缺一个测的就不是"记忆量"：
+      * 不加句式多样性——句式一多，难度就从"记住"变成"泛化"；
+      * **不引入新答案串**——否则词表会跟着映射数涨，而 tied embedding 是共享通路的一部分，
+        等于一边加考题一边给被考的对象扩容，测不出"共享通路背不下"。实测过：用
+        `答案+编号` 扩到 N=160 时词表从 988 涨到 3389，准确率塌到 3%，gap 恒为 0。
+    随机指派（不是轮转）也是必须的：轮转会变成"答案是 base[k mod 10]"这种可推规则，
+    模型学到的是规则而不是一百条独立映射。
+    """
+    if n <= len(base):
+        return list(base)
+    rng = random.Random(SEED + 7919 + n)          # 每个 N 各自确定，但彼此独立
+    answers = [a for _p, a in base]
+    out = list(base)
+    k = 0
+    while len(out) < n:
+        for p, _a in base:
+            if len(out) >= n:
+                break
+            out.append((f"{p}#{k}", rng.choice(answers)))
+        k += 1
+    return out
+
 
 def build_corpus() -> Dict:
     rng = random.Random(SEED)
@@ -206,39 +292,46 @@ def build_corpus() -> Dict:
     ports_held = [9000 + i for i in range(24)]
     fact_table = {p: SERVICES[i % len(SERVICES)] for i, p in enumerate(ports_train + ports_held)}
 
-    def fact_prompt(port: int, with_context: bool) -> str:
+    def fact_prompt(port: int, with_context: bool, svc: str | None = None) -> str:
         q = f"查询端口 {port} 上运行的服务是什么"
         if with_context:
-            ctx = f"【已知】端口 {port} 的服务是 {fact_table[port]}\n"
-            return ctx + q + "\nA: "
+            return fact_line(port, svc or fact_table[port]) + "\n" + q + "\nA: "
         return q + "\nA: "
 
     train: List[Tuple[str, str, str]] = []      # (prompt, answer, domain)
     eval_skill: List[Tuple[str, str, str]] = []
+    all_answers: List[str] = []
     for dom, spec in DOMAIN_SPEC.items():
-        items = spec["items"]
+        items = _extend_items(spec["items"], INTENTS_PER_DOMAIN)
+        base_n = len(spec["items"])
+        all_answers.extend(a for _p, a in items)
         for p, a in items:
             # 训练：每个意图用两种句式；评测：用训练里没出现过的第三种句式
             for t in spec["train_q"]:
                 train.append((t.format(p=p) + "\nA: ", a, dom))
-        for i in (4, 9):
+        for i in _eval_indices(len(items), base_n):
             p, a = items[i]
             eval_skill.append((spec["eval_q"][0].format(p=p) + "\nA: ", a, dom))
     for _ in range(int(len(train) * 0.25)):
         p = rng.choice(ports_train)
-        train.append((fact_prompt(p, True), fact_table[p], "fact"))
+        svc = fact_table[p]
+        if CONFLICT_RATE > 0 and rng.random() < CONFLICT_RATE:
+            # 故意让上下文与先验冲突，并把目标也换成上下文里那个错的：
+            # 模型要学的是"【已知】写什么就答什么"，不是"按我背过的答"
+            svc = rng.choice([s for s in SERVICES if s != fact_table[p]])
+        train.append((fact_prompt(p, True, svc), svc, "fact"))
 
     eval_fact = [(fact_prompt(p, True), fact_table[p], "fact") for p in ports_held]
     eval_fact_noctx = [(fact_prompt(p, False), fact_table[p], "fact") for p in ports_held]
     return {"train": train, "eval_skill": eval_skill, "eval_fact": eval_fact,
             "eval_fact_noctx": eval_fact_noctx, "fact_table": fact_table,
-            "ports_held": ports_held}
+            "ports_held": ports_held, "answers": all_answers}
 
 
 def build_tokenizer(corpus: Dict) -> CharTokenizer:
     texts = [p for items in ("train", "eval_skill", "eval_fact", "eval_fact_noctx")
              for p, _, _ in corpus[items]]
-    extra = ANSWERS + SERVICES
+    extra = list(corpus.get("answers") or ANSWERS) + SERVICES
     tok = CharTokenizer.from_corpus(texts)
     for t in extra:
         tok._add(t)
@@ -530,7 +623,7 @@ def eval_fact(model, tok, kb: KnowledgeBase, items, embed_fn, use_kb: bool,
         ctx = ""
         if use_kb:
             segs = retrieve_for(model, tok, kb, embed_fn, prompt, cfg)
-            ctx = "".join(s.text + "\n" for s in segs)
+            ctx = render_context(segs)          # 与训练侧同一个渲染函数，见 render_context
             keys = _key_tokens(prompt)
             # 判定要严：必须同时命中"这个端口"和"这个答案"。
             # 只看 gold 在不在文本里会被重复的服务名蒙对（每个服务名对应多个端口）。
@@ -602,6 +695,97 @@ def _encode_ids(model, text: str):
 _TOK: CharTokenizer
 
 
+# ── 主张6：热更新知识库（加条目，不重训）──────────────────────────────────────
+def fact_query(port: int) -> str:
+    """和 build_corpus 里 fact_prompt(port, with_context=False) 逐字符相同的裸问题。
+
+    单独提出来是因为主张6必须用不带【已知】的问题：带【已知】的题面本身就把答案
+    写在上下文里，测出来的是抄写能力，不是"更新知识库能不能生效"。
+    """
+    return f"查询端口 {port} 上运行的服务是什么\nA: "
+
+
+def model_fingerprint(model: KSRModel) -> str:
+    """权重指纹。主张6 的硬断言靠它：更新知识库前后必须逐字节相同。"""
+    h = hashlib.sha256()
+    for name, t in sorted(model.state_dict().items(), key=lambda kv: kv[0]):
+        h.update(name.encode("utf-8"))
+        h.update(np.ascontiguousarray(t.detach().cpu().numpy()).tobytes())
+    return h.hexdigest()
+
+
+def eval_hotkb(model, tok, embed, corpus: Dict, cfg: KSRConfig, n_new: int = 200,
+               probe: int = 64) -> Dict:
+    """往知识库里热插 N 条新事实，一个梯度都不走，看模型能不能答对。
+
+    和主张2的口径差别（这是关键，否则测的是抄写不是知识库）：
+      * 问题一律不带【已知】——答案只能从"刚插进去的条目"里检索出来；
+      * 插入前先测旧 24 题在"只靠检索"下的准确率，证明库变大不会把原来能答的题带坏；
+      * 再给一条上界：同样的新事实把答案手抄进题面（= 主张2 的做法），用来把
+        "检索没捞到"和"捞到了但模型不认这种格式"分开；
+      * 最后换一份 KnowledgeBase 从 SSD 重新加载：模型不动，只读库，更新必须跨重启生效。
+    """
+    rng = random.Random(SEED + 17)
+    ports_new = [9100 + i for i in range(n_new)]          # 9000-9023 是留出集，别撞
+    svc_new = {p: SERVICES[(i + 7) % len(SERVICES)] for i, p in enumerate(ports_new)}
+
+    def add_fact(kb: KnowledgeBase, port: int, svc: str, source: str) -> None:
+        text = f"端口 {port} 的服务是 {svc}"
+        kb.add("fact", KnowledgeRecord(rid=KnowledgeRecord.make_id(text), domain="fact",
+                                      kind="fact" if source == "manual" else "correction",
+                                      text=text, answer=svc, source=source, verified=True),
+               embed(text))
+
+    fp_before = model_fingerprint(model)
+    old_items = [(fact_query(p), corpus["fact_table"][p], "fact") for p in corpus["ports_held"]]
+
+    # 现网知识库的既有部分：64 条，不计入更新成本
+    kb = KnowledgeBase(WORK / "hotkb", dim=cfg.hidden_size)
+    for port, svc in corpus["fact_table"].items():
+        add_fact(kb, port, svc, "manual")
+    base_n = kb.size()
+    old_before = eval_fact(model, tok, kb, old_items, embed, True, cfg)
+
+    per_insert: List[float] = []
+    for port in ports_new:
+        t0 = time.perf_counter()
+        add_fact(kb, port, svc_new[port], "hot_insert")
+        per_insert.append(time.perf_counter() - t0)
+
+    probe_ports = rng.sample(ports_new, min(probe, len(ports_new)))
+    new_items = [(fact_query(p), svc_new[p], "fact") for p in probe_ports]
+    upper_items = [(fact_line(p, svc_new[p]) + "\n" + fact_query(p),
+                    svc_new[p], "fact") for p in probe_ports]
+    new_retr = eval_fact(model, tok, kb, new_items, embed, True, cfg)
+    new_upper = eval_fact(model, tok, kb, upper_items, embed, False, cfg)
+    old_after = eval_fact(model, tok, kb, old_items, embed, True, cfg)
+
+    # 换一份实例从 SSD 读库：证明"更新"是落在磁盘上的，不是只在内存里
+    kb2 = KnowledgeBase(WORK / "hotkb", dim=cfg.hidden_size)
+    reload_items = probe_ports[: min(16, len(probe_ports))]
+    reloaded = eval_fact(model, tok, kb2, [(fact_query(p), svc_new[p], "fact")
+                                           for p in reload_items], embed, True, cfg)
+
+    fp_after = model_fingerprint(model)
+    arr = np.asarray(per_insert)
+    vecs = kb.indices["fact"].vectors
+    return {
+        "n_new": n_new, "probed": len(probe_ports),
+        "kb_before": base_n, "kb_after": kb.size(),
+        "zero_retrain": fp_before == fp_after,
+        "fingerprint_before": fp_before[:16], "fingerprint_after": fp_after[:16],
+        "new_retrieval_only": new_retr, "new_hand_copied": new_upper,
+        "old_before_insert": old_before, "old_after_insert": old_after,
+        "reload_from_ssd": reloaded, "reload_probed": len(reload_items),
+        "kb_reloaded_entries": kb2.size(),
+        "insert_seconds_mean": float(arr.mean()), "insert_seconds_p50": float(np.median(arr)),
+        "insert_seconds_p90": float(np.percentile(arr, 90)), "insert_seconds_max": float(arr.max()),
+        "insert_seconds_total": float(arr.sum()),
+        "vector_bytes_per_entry": int(vecs.nbytes // max(1, len(vecs))),
+        "index_rewrite_bytes_per_insert": int(vecs.nbytes),
+    }
+
+
 # ── 稠密基线（同底座，标准 FFN，全注意力）：用来实测速度差 ─────────────────────
 class DenseTiny(torch.nn.Module):
     def __init__(self, cfg: KSRConfig, ffn_hidden: int):
@@ -664,7 +848,7 @@ def main() -> int:
     if not os.environ.get("KSR_KEEP"):
         # 每轮都从干净的知识目录开始：上一轮的条目会和新写的混在一起，
         # "知识库有多少条"会翻倍失真，检索也会被旧条目污染。
-        for sub in ("knowledge", "kb_missing", "corrections"):
+        for sub in ("knowledge", "kb_missing", "corrections", "hotkb"):
             shutil.rmtree(WORK / sub, ignore_errors=True)
     report: Dict = {}
 
@@ -708,7 +892,8 @@ def main() -> int:
         _ASSIGN = learned_assignment(model, tok, corpus)
         print("\n== 3) 训练常识校验器（配对：正确专家 vs 故意塞错专家）==")
         train_corrector(model, tok, corpus, _ASSIGN, steps=CSTEPS)
-        torch.save({"model": model.state_dict(), "assignment": _ASSIGN}, ckpt)
+        torch.save({"model": model.state_dict(), "assignment": _ASSIGN, "cfg_path": str(cfg_path)},
+               ckpt)
         print(f"  已保存检查点 {ckpt}")
     print(f"  路由学到的领域→专家分配: {_ASSIGN}")
     report["assignment"] = _ASSIGN
@@ -784,7 +969,7 @@ def main() -> int:
     kb2.add("fact", KnowledgeRecord(rid=KnowledgeRecord.make_id(t), domain="fact", kind="correction",
                                    text=t, answer=svc, source="correction", verified=True), embed(t))
     segs = retrieve_for(model, tok, kb2, embed, q, cfg)
-    after, _ = answer_of(model, tok, "".join(s.text + "\n" for s in segs) + q)
+    after, _ = answer_of(model, tok, render_context(segs) + q)
     print(f"  [主张4 自我进化] 端口 {port} 缺失：纠正前答 {before!r}（应为 {svc!r}）"
           f"→ 回写并审核通过 → 纠正后答 {after!r}；复犯率 "
           f"{0 if after == svc else 1} → {'0 ✓' if after == svc else '1 ✗'}")
@@ -815,6 +1000,29 @@ def main() -> int:
     report["l2_consolidation"] = {"port": port2, "before": before2, "after": after2, "gold": svc2,
                                   "expert": fact_expert, "finetune": ft,
                                   "retention_before": retain_before, "retention_after": retain_after}
+    dump()
+
+    # 主张6：热更新知识库——加条目不重训。这是"专家和知识库解耦"唯一可证伪的形式：
+    # 权重指纹必须逐字节不变，而新事实能答对。
+    n_hot = int(os.environ.get("KSR_HOTKB_N", "200"))
+    hot = eval_hotkb(model, tok, embed, corpus, cfg, n_new=n_hot)
+    print(f"\n  [主张6 热更新知识库] 插入 {hot['n_new']} 条新事实（{hot['kb_before']} → "
+          f"{hot['kb_after']} 条），权重指纹{'不变 ✓' if hot['zero_retrain'] else '变了 ✗'}"
+          f"（{hot['fingerprint_before']}…）——一个梯度都没走，模型也没重新保存")
+    print(f"          新事实（裸问题，答案只能检索到）：{hot['new_retrieval_only']['acc']*100:.0f}%"
+          f"，检索命中 {hot['new_retrieval_only']['retrieval_hit']*100:.0f}%，"
+          f"注入 {hot['new_retrieval_only']['avg_injected_tokens']:.1f} token/题"
+          f"　‖上界（答案手抄进题面，= 主张2 口径）：{hot['new_hand_copied']['acc']*100:.0f}%")
+    print(f"          旧 {hot['old_before_insert']['n']} 题不受污染：插入前 "
+          f"{hot['old_before_insert']['acc']*100:.0f}% → 插入后 {hot['old_after_insert']['acc']*100:.0f}%"
+          f"（库里多了 {hot['kb_after']-hot['kb_before']} 条）")
+    print(f"          跨重启生效：模型不动、只从 SSD 重载 {hot['kb_reloaded_entries']} 条 → "
+          f"{hot['reload_from_ssd']['acc']*100:.0f}%（抽样 {hot['reload_probed']} 题）")
+    print(f"          单条更新成本：均值 {hot['insert_seconds_mean']*1e3:.1f} ms / p50 "
+          f"{hot['insert_seconds_p50']*1e3:.1f} ms / p90 {hot['insert_seconds_p90']*1e3:.1f} ms / "
+          f"合计 {hot['insert_seconds_total']:.1f} s；每条向量 {hot['vector_bytes_per_entry']} B，"
+          f"但每次 add 都把整份 jsonl+npy 重写一遍（当前 {hot['index_rewrite_bytes_per_insert']:,} B/次）")
+    report["hot_kb_update"] = hot
     dump()
     print(f"\n完整结果写入 {WORK/'report.json'}")
     return 0

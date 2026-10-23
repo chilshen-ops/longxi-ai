@@ -210,8 +210,12 @@ class ExpertStore(nn.Module):
         self.evict_events = 0
 
     def _update_accounting(self) -> None:
+        # pool[0] 已经是"一个专家的整栈"（每层一片），**不能再乘 num_layers**。
+        # 之前乘了两遍：180M 配置（每栈 9.44M 参数、12 层）按 8 个热集合上报 1.81 GB，
+        # 实际只有 151 MB，差了整整一个层数倍。ksr_calc 那边的 cold_stack_bytes 是
+        # 独立算的、口径正确，所以这个错只在运行期报表里出现过。
         per = sum(p.numel() for p in self.pool[0].parameters()) if self.cfg.num_skill_experts else 0
-        self.stack_bytes = per * self.cfg.num_layers
+        self.stack_bytes = per
         self.resident_bytes = self.stack_bytes * len(self.hot) * self._itemsize()
 
     def _itemsize(self) -> int:
@@ -231,6 +235,26 @@ class ExpertStore(nn.Module):
         self._update_accounting()
 
     compute_device: torch.device = torch.device("cpu")
+    # 动态驻留开关。默认关：训练和现有实验的行为不变，只有显式开启才搬栈。
+    paged: bool = False
+
+    def enable_paging(self, device: torch.device, hot: Optional[List[int]] = None,
+                     capacity: Optional[int] = None) -> None:
+        """推理期的动态驻留：只有热集合的栈在计算设备上，其余放 CPU，前向选中谁就搬谁。
+
+        **容量必须和初始热集合一起设。** ensure_hot 的换出判据读的是 cfg.hot_experts；
+        只设初始集合不设容量，前向第一步就会把其余专家调进来、一个都不换出——这是实测出来的：
+        只设 4 个跑完一轮 hot 又长回 8，峰值显纹丝不动，搬运全发生在预热里（所以稳态计数是 0）。
+
+        只在 no_grad 下生效（见 KSRBlock 里的 torch.is_grad_enabled() 判断）。原因是这条架构
+        里最容易踩的一只脚：set_hot 搬的是 p.data，参数一旦在训练中途换设备，计算图里存的还是
+        搬运前的旧张量，梯度落到旧张量上、更新被静默丢掉——不报错，只是白训。
+        """
+        self.compute_device = device
+        if capacity is not None:
+            self.cfg.hot_experts = max(1, int(capacity))
+        self.paged = True
+        self.set_hot(list(self.hot) if hot is None else list(hot))
 
     def ensure_hot(self, eid: int) -> bool:
         """把某个专家的整栈搬上计算设备。返回是否发生了搬运（用于统计命中率）。"""
@@ -340,17 +364,40 @@ class KSRBlock(nn.Module):
             # 而 L2 微调则因为专家压根没进计算图而报 "does not require grad"。
             # 权重仍沿用路由给的分，保证强制路径和普通路径的量级可比。
             sel = self.expert_norm(x)
+            if experts.paged and not torch.is_grad_enabled():
+                experts.ensure_hot(force_expert)          # 强制路径也要先把栈调进来
             out = experts.pool[force_expert][self.layer_index - 1](sel)
             expert_out = out * w.sum(-1, keepdim=True)
         else:
-            for slot in range(k):
-                for eid in range(experts.cfg.num_skill_experts):
-                    mask = (ids[:, :, slot] == eid)
-                    if not mask.any():
-                        continue
-                    sel = self.expert_norm(x)[mask]                        # [N,H] 一次性批量算
-                    out = experts.pool[eid][self.layer_index - 1](sel)     # 整栈中的第 layer 片
-                    expert_out[mask] += out * w[mask, slot].unsqueeze(-1)
+            # 按专家**分段**，不是"对每个候选专家扫一遍全 batch"。
+            # 旧写法（求 mask → mask.any() → x[mask] → expert_out[mask] +=）有三处强制
+            # GPU→CPU 同步（布尔索引的输出形状依赖数据），而且 expert_norm 在循环里被
+            # 重复算了 E 次。代价实测过：每 token 的计算量不变（激活参数 114.90M→114.94M），
+            # 吞吐却随候选专家数下降 224/180/139/113/90 tok/s（E=1/2/4/8/16，P40 fp16 b8）。
+            # 现在整层只同步一次（把分段边界取到 host），其余全是普通 kernel。
+            n_tok = x.shape[0] * x.shape[1]
+            sel = self.expert_norm(x).reshape(n_tok, x.shape[-1])    # 每层只算一次
+            flat_ids = ids[:, :, :k].reshape(-1)                     # [T*k]
+            flat_w = w[:, :, :k].reshape(-1)
+            order = flat_ids.argsort()                               # 按专家排序
+            counts = torch.bincount(flat_ids, minlength=experts.cfg.num_skill_experts)
+            ends = torch.cumsum(counts, 0).tolist()                  # ← 整层唯一一次同步
+            rows = order // k                                        # 段 → token 行号
+            sorted_rows = sel[order]                                 # 一次 gather，无同步
+            contrib = torch.empty_like(sorted_rows)
+            start = 0
+            for eid, end in enumerate(ends):
+                if end > start:
+                    if experts.paged and not torch.is_grad_enabled():
+                        # 要用到谁，才把谁的整栈调进计算设备（LRU 换出别人）。
+                        # 必须**就地调**，不能进循环前一次性调完：容量小于本层要用的专家数时，
+                        # 后调进来的会把先调的换出去，等 GEMM 走到它时它已经回 CPU 了——
+                        # 这个错是实测出来的（hot<8 直接 "mat2 is on cpu"）。
+                        experts.ensure_hot(eid)
+                    out = experts.pool[eid][self.layer_index - 1](sorted_rows[start:end])
+                    contrib[start:end] = out * flat_w[order[start:end]].unsqueeze(-1).to(out.dtype)
+                start = end
+            expert_out = torch.zeros_like(sel).index_add_(0, rows, contrib).view_as(x)
         x = x + expert_out
         return x, route, reasoner_out
 

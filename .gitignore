@@ -11,3 +11,7 @@ work-smoke3/
 work-starved/
 *.pt
 *.npy
+.venv-gpu/
+.dl/
+work-*/
+*.log
