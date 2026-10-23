@@ -73,46 +73,92 @@ def token_ok(tok, text: str) -> bool:
     return len(tok.encode(text)) == 1
 
 
-def ask(model, tok, embed, kb, cfg, port: int, note: str = "") -> None:
-    """完整展示一次带检索的回答：检索到什么、注入了几个 token、模型采不采纳。"""
+def probe(model, tok, embed, kb, cfg, port: int) -> dict:
+    """一次带检索的回答，返回结构化结果（命令行和网页共用这一份逻辑）。
+
+    刻意把"不检索时答什么"和"带检索时答什么"放在一起：只看最终答案，就把"检索起了作用"
+    和"模型本来就会"混成一回事了。
+    """
     q = E.fact_query(port)
     segs = E.retrieve_for(model, tok, kb, embed, q, cfg)
     ctx = E.render_context(segs)
     prior, _ = E.answer_of(model, tok, q)
     ans, _ = E.answer_of(model, tok, ctx + q)
+    # "采纳了知识库"这个判断必须先看检索到的到底是不是在讲这个端口：删掉正确条目之后，
+    # 库里没有这条，捞上来的全是别的端口的条目——模型照样会照抄，那不能算采纳了知识。
+    needle = f"端口 {port} 的服务是"
+    matched = any(needle in s.text for s in segs)
     hit = next((s.record.answer for s in segs if s.record.answer), "")
-    used = "采纳了知识库" if ans == hit else ("坚持自己的先验" if ans == prior else "给了第三个答案")
-    print(f"\n问题：{q}")
-    if segs:
-        print(f"  检索：命中 {len(segs)} 条，注入 {sum(s.tokens for s in segs)} token"
-              f"（预算 {cfg.kb_max_total_tokens}）")
-        for s in segs:
-            print(f"    {s.text}   [混合分 {s.score:.3f}，含符号命中加成]")
+    return {
+        "question": q,
+        "port": port,
+        "segments": [{"text": s.text, "score": round(s.score, 3)} for s in segs],
+        "injected_tokens": sum(s.tokens for s in segs),
+        "budget": cfg.kb_max_total_tokens,
+        "prior": prior,
+        "answer": ans,
+        "matched": matched,
+        "kb_answer": hit if matched else "",
+        "adopted": matched and ans == hit,
+        "held_to_prior": bool(prior) and ans == prior and not (matched and ans == hit),
+    }
+
+
+def ask(model, tok, embed, kb, cfg, port: int, note: str = "") -> None:
+    """完整展示一次带检索的回答：检索到什么、注入了几个 token、模型采不采纳。"""
+    r = probe(model, tok, embed, kb, cfg, port)
+    print(f"\n问题：{r['question']}")
+    if r["segments"]:
+        head = "检索：命中" if r["matched"] else "检索：库里没有这个端口，捞上来的是别的端口的条目"
+        print(f"  {head} {len(r['segments'])} 条，注入 {r['injected_tokens']} token"
+              f"（预算 {r['budget']}）")
+        for s in r["segments"]:
+            print(f"    {s['text']}   [混合分 {s['score']:.3f}，含符号命中加成]")
     else:
         print("  检索：知识库里没有这条")
-    print(f"  不检索时模型答：{prior}")
-    print(f"  带检索时模型答：{ans}   ← {used}")
+    copied = any(r["answer"] and r["answer"] in s["text"] for s in r["segments"])
+    if not r["matched"]:
+        used = "没有这条知识——它照抄了一条不相干的" if copied else "没有这条知识——它给了自己的答案"
+    else:
+        used = ("采纳了知识库" if r["adopted"]
+                else ("坚持自己的先验" if r["held_to_prior"] else "给了第三个答案"))
+    print(f"  不检索时模型答：{r['prior']}")
+    print(f"  带检索时模型答：{r['answer']}   ← {used}")
     if note:
         print(f"  {note}")
 
 
-def add_fact(model, kb, embed, port: int, svc: str, replace: bool) -> None:
-    """写一条知识：先删同题的旧条目（改的情况），再写入，并证明权重一个字节都没动。"""
+def write_fact(model, kb, embed, port: int, svc: str, replace: bool) -> dict:
+    """写一条知识，返回结构化结果（命令行和网页共用）。
+
+    先删同题的旧条目（改的情况），再写入，并且把权重指纹前后各算一次——
+    "更新知识库不需要重训"这句话的证据就是这个指纹不变。
+    """
     text = f"端口 {port} 的服务是 {svc}"
     fp_before = E.model_fingerprint(model)
-    verb = "改" if replace else "加"
-    for dom, old in ([] if not replace else kb.find(f"端口 {port} 的服务是")):
+    removed = []
+    for dom, old in (kb.find(f"端口 {port} 的服务是") if replace else []):
         kb.remove(dom, old.rid)
-        print(f"  删掉旧条目：{old.text}")
+        removed.append(old.text)
     t0 = time.perf_counter()
     kb.add("fact", KnowledgeRecord(rid=KnowledgeRecord.make_id(text), domain="fact",
                                    kind="fact", text=text, answer=svc,
                                    source="manual", verified=True), embed(text))
     ms = (time.perf_counter() - t0) * 1000
     fp_after = E.model_fingerprint(model)
-    print(f"  {verb}成功：{text}   用时 {ms:.1f} ms，知识库现有 {kb.size()} 条")
-    print(f"  权重指纹 {fp_before[:16]}… → {fp_after[:16]}… "
-          f"{'没变（一个梯度都没走）✓' if fp_before == fp_after else '变了 ✗'}")
+    return {"text": text, "ms": round(ms, 1), "size": kb.size(), "removed": removed,
+            "fingerprint_before": fp_before, "fingerprint_after": fp_after,
+            "weights_unchanged": fp_before == fp_after}
+
+
+def add_fact(model, kb, embed, port: int, svc: str, replace: bool) -> None:
+    r = write_fact(model, kb, embed, port, svc, replace)
+    for t in r["removed"]:
+        print(f"  删掉旧条目：{t}")
+    print(f"  {'改' if replace else '加'}成功：{r['text']}   用时 {r['ms']:.1f} ms，"
+          f"知识库现有 {r['size']} 条")
+    print(f"  权重指纹 {r['fingerprint_before'][:16]}… → {r['fingerprint_after'][:16]}… "
+          f"{'没变（一个梯度都没走）✓' if r['weights_unchanged'] else '变了 ✗'}")
 
 
 def main() -> int:

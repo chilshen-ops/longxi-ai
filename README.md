@@ -11,20 +11,37 @@
 演示台演示的是这个项目**唯一有硬证据**的能力：往知识库里加一条事实，不重训、不产生梯度，
 模型立刻能答对。
 
+**网页版**（推荐：浏览器打开就能用。只用 Python 标准库，不装任何包）：
+
 ```powershell
-# Windows / PowerShell（依赖已装在 .venv-lib）
 cd ksr-moe
 $env:PYTHONPATH="$PWD\.venv-lib"; $env:PYTHONIOENCODING='utf-8'; $env:KSR_THREADS='2'
+python tools\webui.py --work work-conflict --port 8765
+# 浏览器打开 http://127.0.0.1:8765　（模型在后台加载约 40 秒，页面顶部会显示进度）
+```
+
+```bash
+# Linux / macOS
+PYTHONPATH=.venv-lib PYTHONIOENCODING=utf-8 python3 tools/webui.py --work work-conflict --port 8765
+```
+
+**命令行版**（同样的功能，没有终端就跳过它）：
+
+```powershell
 python tools\play.py --work work-conflict --demo    # 自动跑一遍：问 → 加一条 → 立刻答对
 python tools\play.py --work work-conflict           # 交互模式
 ```
 
 ```bash
-# Linux / macOS
 PYTHONPATH=.venv-lib PYTHONIOENCODING=utf-8 python3 tools/play.py --work work-conflict --demo
 ```
 
-交互模式里可以试这些：
+网页上是四个按钮：**问 / 加一条 / 改 / 删掉**。它刻意把两件事**并排**显示——"不检索时模型答
+什么"和"带检索时模型答什么"——因为只看最终答案，就把"检索起了作用"和"模型本来就会"混成一回事。
+检索到的片段如果不是在讲这个端口，页面会明说"没有这条知识"，不会把"照抄了一条不相干的条目"
+算成"采纳了知识库"。
+
+命令行里可以试这些：
 
 | 想试什么 | 敲这个 | 会看到什么 |
 |---|---|---|
@@ -137,7 +154,8 @@ tools/ksr_calc.py 参数量 / FLOPs / 显存 / 冷专家搬运的解析计算器
 tools/bench.py    吞吐与显存实测：--device/--dtype/--batch，--side dense 生成同参数量稠密基线，
                   --hot-experts 测动态驻留（显存 vs 吞吐 vs 搬运次数）
 tools/attrib.py   知识归属探针：gap_experts / gap_kb / 上界探针 / 重复权威，输出判定
-tools/play.py     演示台：加一条知识立刻能答对（--demo 自动演示，或直接进交互模式）
+tools/play.py     演示台（命令行）：加一条知识立刻能答对（--demo 自动演示，或直接进交互模式）
+tools/webui.py    演示台（网页版）：只用标准库起服务，四个按钮 问/加/改/删，把"有没有检索"并排显示
 tools/configs/    ksr7b_32L.json（7B 定稿）、ksr7b.json（紧凑版）、四个可运行原型
 tests/            独立可跑的回归测试（不依赖 pytest）
 ```
