@@ -85,6 +85,42 @@ python tools/bench.py --config tools/configs/ksr_180m.json --side ksr \
 
 `--verify` 会先证明新写的批量解码循环和 `model.generate()` 逐 token 一致，再谈吞吐数字。
 
+## 改完之后必须同步 GitHub（每一次都要）
+
+这台机器上 git 装在 `C:\Program Files\Git\cmd\git.exe`，**不在 PATH 上**，要用完整路径：
+
+```powershell
+$g = 'C:\Program Files\Git\cmd\git.exe'
+& $g -C A:\default-workspace\ksr-moe status --short
+```
+
+提交前必须全绿，三件都要：
+
+```bash
+python tests/test_model_core.py         # 12/12
+python tests/test_kb_retrieval.py       # 5/5
+python tools/ksr_calc.py --selfcheck    # 退出码 0
+```
+
+`.dl/`（下载缓存，2.4 GB）和 `work-*/`（实验产物）都在 `.gitignore` 里，不要提交。
+`work-sup/` 是被跟踪的实验输出，改到它要先确认是有意的。
+
+**推送需要 GitHub 凭据，而这台机器上一个都没有**（环境变量、`.git-credentials`、`.netrc`、
+Windows 凭据管理器都查过）。两条路，任选其一：
+
+```powershell
+# 1) 界面授权（会弹浏览器登录）
+$env:GCM_INTERACTIVE='always'; & $g push origin main
+
+# 2) 用带 repo 作用域的 PAT（一次配好，之后不用再认证）
+& $g remote set-url origin https://<用户名>:<PAT>@github.com/chilshen-ops/longxi-ai.git
+& $g push origin main
+```
+
+这个仓库把 `core.autocrlf` 设成了 `input`：不改的话会有几个文件永远显示 modified，
+而 `git diff` 里是空的（纯行尾差异），会把真实改动淹掉。同理，`git checkout -- <文件>`
+可以还原这种没有内容差异的"假改动"。
+
 ## 结构
 
 ```
