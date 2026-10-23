@@ -406,14 +406,17 @@ padding:12px;margin:12px 0;font-size:13px}.kbi{border-bottom:1px dashed var(--li
 .spin{color:var(--ac)}.foot{color:var(--dim);font-size:12px;margin-top:22px;line-height:1.8}
 </style></head><body><div class="wrap">
 <h1>聊天台 · 真模型 + 外部知识库</h1>
-<div class="sub">模型本身的能力：对话、思考、调工具。这个项目加上去的是最后一件事：
-<b style="color:var(--fg)">它记住的新事实存在模型外面，写进去不用重训，权重一个字节都不动。</b></div>
-<div class="bar"><span>状态 <b id="st">加载中</b></span><span>模型 <b id="md">—</b></span>
+<div class="sub">分工写清楚，免得误会：<b style="color:var(--fg)">对话、思考、调工具是底座模型（Qwen3）本身的能力，
+不是这个项目做的</b>。这个项目加上去的是外面那一层——它记住的新事实存在模型外面，
+写进去不用重训，权重一个字节都不动，换个进程还记得。</div>
+<div class="bar"><span>状态 <b id="st">加载中</b></span>
+<span>底座 <b id="md">—</b>（外部预训练，非本项目所训）</span>
 <span>参数 <b id="pm">—</b></span><span>知识库 <b id="kbN">—</b> 条</span>
 <span>权重指纹 <b id="fp">—</b></span><span>速度 <b id="sp">—</b> tok/s</span></div>
 <div id="kb"></div><div id="log"></div>
-<div class="foot">这是 0.6B 的小模型：对话能跑，但推理质量有限（思考过程会有想歪的地方）。
-要更好的质量就换 1.7B / 4B——这台机器显存够（两张 24 GB 全空），只是主机内存紧。</div>
+<div class="foot">底座是 Qwen3（0.6B 和 1.7B 都能跑，现在跑的是 1.7B）：对话没问题，
+推理质量有限，思考过程会想歪。要更好得换 4B——显存够（24 GB 全空），卡在主机内存只剩 4.9 GB。
+本页真正演示的是外面那一层：写入 46 ms、零梯度、跨进程生效。工具调用和自动检索的过程都摊开给你看。</div>
 </div>
 <div class="in"><input id="t" placeholder="跟它说点什么，比如：记一下，我们项目的部署机器是 10.20.30.40"
  autofocus><button class="go" onclick="send()">发送</button>
