@@ -169,6 +169,39 @@ def test_remove_and_find_keep_records_and_vectors_aligned():
             assert not any("8002" in s.text for s in segs), "删掉的条目还在被检索到"
 
 
+def test_adding_the_same_rid_updates_instead_of_duplicating():
+    """同一条知识重复写必须**覆盖**，不能追加。
+
+    这是演示台跑出来的真问题：每跑一次就把整库重新灌一遍，64 条涨到 383 条；
+    而"改一条"要先删旧的，结果一次删掉两条——库里堆满了同一条知识。
+    rid 是正文哈希，所以重复 add 必然是同一条。覆盖而不是跳过，是因为同一条正文
+    可能带着更正后的 answer，那种情况要的是新值。
+    """
+    def vec(seed: int) -> np.ndarray:
+        return np.random.default_rng(seed).standard_normal(DIM).astype(np.float32)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        kb = KnowledgeBase(tmp, dim=DIM)
+        text = "端口 8001 的服务是 svc1"
+        for _ in range(5):
+            kb.add("fact", KnowledgeRecord(rid=KnowledgeRecord.make_id(text), domain="fact",
+                                          kind="fact", text=text, answer="svc1",
+                                          source="manual", verified=True), vec(1))
+        assert kb.size() == 1, f"重复写把库撑到 {kb.size()} 条"
+
+        kb.add("fact", KnowledgeRecord(rid=KnowledgeRecord.make_id(text), domain="fact",
+                                      kind="correction", text=text, answer="svc9",
+                                      source="correction", verified=True), vec(2))
+        assert kb.size() == 1, "覆盖不该让库变大"
+        rec = kb.indices["fact"].records[0]
+        assert rec.answer == "svc9" and rec.source == "correction", rec
+        segs = kb.retrieve(vec(2), ["fact"], top_k=TOP_K,
+                           max_tokens_per_segment=MAX_SEG_TOKENS,
+                           max_total_tokens=MAX_TOTAL_TOKENS, count_tokens=_count,
+                           query_text="查询端口 8001 的服务")
+        assert segs and segs[0].record.answer == "svc9", [s.text for s in segs]
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

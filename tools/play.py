@@ -13,6 +13,7 @@
     问 <端口> / 直接敲问题      查知识库并回答，显示检索到了什么、模型有没有采纳
     加 <端口> <服务名>          写入知识库（计时 + 证明权重指纹没变），然后立刻回答它
     改 <端口> <服务名>          先删旧条目再写新的——"哪里不对修哪里"
+    删 <端口>                  把这条知识从库里去掉
     知识                        知识库规模与最近几条
     帮助 / 退出
 """
@@ -44,6 +45,7 @@ HELP = """命令：
   问 <端口>            查知识库并回答（也可以直接把问题打出来）
   加 <端口> <服务名>   写入知识库 → 立刻回答，全程不重训、不产生梯度
   改 <端口> <服务名>   先删掉旧条目再写新的（哪里不对修哪里）
+  删 <端口>          把这条知识从库里去掉
   知识                 知识库规模与最近几条
   退出
 """
@@ -168,10 +170,28 @@ def main() -> int:
             port, svc = int(m.group(2)), m.group(3)
             if not token_ok(tok, svc):
                 print(f"  注意：「{svc}」不在模型词表里（会被拆成 {len(tok.encode(svc))} 个字符），"
-                      f"模型多半答不出来。它只认训练时见过的服务名，比如 svc0…svc19。"
-                      f"这正是要说清楚的边界：知识库能补『哪个端口对应哪个服务』，"
+                      f"模型读不出来。知识库能补『哪个端口对应哪个服务』，"
                       f"补不了『模型从没学过怎么读这个词』。")
+            elif svc not in set(corpus["fact_table"].values()):
+                # 实测到的真实边界，不是猜的：「Panov」是词表里的一个整 token（另一个领域的词表里
+                # 就有人名），检索也命中了（混合分 1.93），模型照样不抄。原因不是读不出词，
+                # 而是它只在见过的答案形状（svcNN）里学会照抄上下文——认账是格式绑定的。
+                print(f"  注意：「{svc}」模型**认识**（是一个整 token），但这个槽位上它从没被要求"
+                      f"抄过这种形状的答案。接下来大概率不采纳——这不是读不出词，"
+                      f"而是**认账只在它见过的答案形状里成立**。")
             add_fact(model, kb, embed, port, svc, replace=m.group(1) == "改")
+            ask(model, tok, embed, kb, cfg, port)
+            continue
+        m = re.match(r"^删\s+(\d{3,7})\s*$", line)
+        if m:
+            port = int(m.group(1))
+            gone = 0
+            for dom, old in kb.find(f"端口 {port} 的服务是"):
+                kb.remove(dom, old.rid)
+                gone += 1
+                print(f"  删掉：{old.text}")
+            if not gone:
+                print(f"  没有找到端口 {port} 的条目")
             ask(model, tok, embed, kb, cfg, port)
             continue
         m = re.match(r"^(问)?\s*(\d{3,7})\s*$", line)

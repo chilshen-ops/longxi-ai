@@ -61,12 +61,27 @@ class VectorIndex:
         # 省掉一份会不同步的副本。
         self.inverted: Dict[str, List[int]] = {}
 
+    def _rebuild_inverted(self) -> None:
+        self.inverted = {}
+        for row, rec in enumerate(self.records):
+            for key in _key_tokens(rec.text):
+                self.inverted.setdefault(key, []).append(row)
+
     def add(self, rec: KnowledgeRecord, emb: Sequence[float]) -> None:
         v = np.asarray(emb, dtype=np.float32).reshape(-1)
         assert v.shape == (self.dim,), f"embedding 维度 {v.shape} != {self.dim}"
         norm = float(np.linalg.norm(v))
         if norm > 0:
             v = v / norm
+        # rid 是按正文哈希算的，所以"同一条知识"必然同 rid。重复 add 必须是覆盖而不是追加：
+        # 实测过，演示台每跑一次就把整库重新灌一遍，64 条涨到 383 条，"改一条"一次要删掉两条。
+        # 覆盖而不是跳过，是因为同一条正文可能带着更正后的 answer——那种情况要的是新值。
+        for i, old in enumerate(self.records):
+            if old.rid == rec.rid:
+                self.records[i] = rec
+                self.vectors[i] = v
+                self._rebuild_inverted()      # 正文可能变了，倒排必须重建
+                return
         self.records.append(rec)
         self.vectors = np.concatenate([self.vectors, v[None]], axis=0)
         row = len(self.records) - 1
