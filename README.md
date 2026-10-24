@@ -210,8 +210,9 @@ python tests/test_finetune_encode.py    # 4/4
 `.dl/`（下载缓存，2.4 GB）和 `work-*/`（实验产物）都在 `.gitignore` 里，不要提交。
 `work-sup/` 是被跟踪的实验输出，改到它要先确认是有意的。
 
-**推送需要 GitHub 凭据，而这台机器上一个都没有**（环境变量、`.git-credentials`、`.netrc`、
-Windows 凭据管理器都查过）。两条路，任选其一：
+**推送现在直接能用**：这台机器已经配好凭据——仓库里 `credential.helper=store`，
+`C:\Users\Mon\.git-credentials` 里有 chilshen-ops 的条目（实测非交互 `git push` 直接过）。
+换一台机器要重配，两条路任选：
 
 ```powershell
 # 1) 界面授权（会弹浏览器登录）
