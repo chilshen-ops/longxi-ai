@@ -109,6 +109,15 @@ def boot() -> None:
         tok.padding_side = "left"
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_PATH, dtype=torch.float16, device_map="cuda:0", low_cpu_mem_usage=True)
+        # 可选：叠一个 LoRA adapter（tools/finetune.py 训出来的）。
+        # 这里刻意用 merge_and_unload()：把 LoRA 并进底座权重，推理路径和没 adapter 时
+        # 一模一样，测出来的差别就只是"训练有没有用"，不掺 adapter 运行时开销这种干扰。
+        adapter = os.environ.get("KSR_CHAT_ADAPTER", "").strip()
+        if adapter:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, adapter)
+            model = model.merge_and_unload()
+            CTX["adapter"] = adapter
         model.eval()
         dim = int(model.config.hidden_size)
         kb = KnowledgeBase(KB_DIR, dim=dim)

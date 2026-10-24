@@ -34,6 +34,48 @@ $env:KSR_CHAT_MODEL='A:\default-workspace\qwen3-1.7b'
 `【已知】` 注入上下文——页面会把这一步单独显示出来（`auto_retrieve`），能看到它查到了什么、
 答案是怎么变的。工具路径也留着，两条各自测各自的数。
 
+## 试过的路：给工具调用做 LoRA 微调（实测：整体不如底座）
+
+流程三段：`tools/sftdata.py` 造 39600 条五类对话（查/写/不用工具/算/拒答；评测实体全部
+不与 chatbench 重叠，逐个查过在训练数据里出现 0 次）→ `tools/finetune.py` 做 LoRA
+（r=16 只注 qkvo，可训 6.42M 参数、占 0.37%；底座 fp16 冻结、可训练部分转 fp32）→
+chatui 用 `KSR_CHAT_ADAPTER` 叠上 adapter（走 `merge_and_unload()`，推理路径和没 adapter
+时逐字节一致，测出来的差别只是训练本身）→ `tools/chatbench.py` 两种模式各量一遍。
+
+对照（同一台机器同一时段，两边都是新跑的；留出的是实体，句式在训练里出现过——测的是
+学到的行为能不能泛化到没见过的事实，不是没见过的句子）：
+
+| | 底座 | + adapter |
+|---|---|---|
+| 工具路径：该查时自己去查 | 4/6 | 3/6 ↓ |
+| 工具路径：该写时自己去写 | 3/3 | 0/3 ↓ |
+| 工具路径：不该动时动了 | 1/3 | **0/3**（修好了） |
+| 自动检索：本身命中 | 6/6 | 6/6 |
+| 自动检索：拿到之后认账 | 6/6 | 1/6 ↓ |
+| 自动检索：拿到之前自己也去查 | 6/6 | 1/6 ↓ |
+
+**只有误触发被修好了，其余全面变差。** 失败的样子和原因都定位到了：
+
+- 过拟合是明显的：train loss 0.002、验证集 loss 0.094。合成数据句式有限，模型背下了模板。
+- 没调工具的那些用例，模型输出的是**裸 JSON**（`{"name": "kb_add", ...}`，没有
+  `​tool_call` 包装）——载荷学会了，包装丢了。
+- auto 认账崩掉有结构性原因：`【已知】` 这种注入格式**训练数据里一次都没出现过**，
+  微调把条件分布收窄到训练那一种，自动检索的提示词反而出了分布。
+- 一个更要紧的事实：底座本来就会写（3/3）。这次微调瞄准的"该写 0/3"根本不存在——
+  那个 0/3 是更早一个坏 adapter 的症状，不是底座的缺陷。
+
+方法要在什么条件下才可能有用（还没做）：混入通用指令数据保泛化、训练里带上 `【已知】`
+注入格式、句式多样性或按验证集早停。做之前该先问值不值——底座剩的两个毛病里，
+误触发这条用"把什么不算知识写进工具描述"已经部分解决（2/3→1/3），这次微调把它修到 0/3，
+是它目前唯一的净收益。
+
+另外，"损失只算模型自己生成的那几轮"这件事有两个坑，**都是静默的**——不报错，
+只是训出来的东西不能用：①先搜正文再回头验位置，会把用户消息里重复出现的同一句话
+当成 assistant 正文（工具调用复述问题、改写任务原样返回都会踩到）；②框过
+`<|im_end|>`，模型就去学"替用户说话"了。两个都被 `tests/test_finetune_encode.py`
+钉死了，改 `encode()` 必须先过它。
+
+
 ## 先跑起来看看（30 秒）
 
 演示台演示的是这个项目**唯一有硬证据**的能力：往知识库里加一条事实，不重训、不产生梯度，
@@ -108,7 +150,7 @@ export PYTHONPATH="$PWD/.venv-lib"
 
 python tools/ksr_calc.py --selfcheck          # 规格自校验，必须退出码 0
 python tests/test_model_core.py               # 模型核心回归测试，当前 12/12
-python tests/test_kb_retrieval.py             # 检索回归测试（不依赖库规模），当前 5/5
+python tests/test_kb_retrieval.py             # 检索回归测试（不依赖库规模），当前 6/6
 python -m ksr.experiment                      # 端到端：训练 + 六项主张实测
 python tools/attrib.py --work work-scaled     # 知识归属探针：知识到底在专家/KB/哪里都没有
 ```
@@ -131,6 +173,16 @@ python tools/bench.py --config tools/configs/ksr_180m.json --side ksr \
 
 `--verify` 会先证明新写的批量解码循环和 `model.generate()` 逐 token 一致，再谈吞吐数字。
 
+微调这条线（都要 `.venv-gpu`、清掉 PYTHONPATH、`KSR_CHAT_MODEL` 指向模型目录；结论见上面
+「试过的路」一节）：
+
+```bash
+python tools/sftdata.py                        # 造五类对话 39600+400 条，默认写 work-chat/sft/（实体不与评测集重叠）
+python tools/finetune.py                       # LoRA，默认 cuda:1 / lr=1e-5（三档学习率实测见其文档），约 3.7h
+KSR_CHAT_ADAPTER=work-chat/lora-v2/final python tools/chatbench.py   # 带 adapter 跑两种模式
+python tests/test_finetune_encode.py        # 改 encode() 必须先过这个（无模型目录时自动跳过）
+```
+
 ## 改完之后必须同步 GitHub（每一次都要）
 
 这台机器上 git 装在 `C:\Program Files\Git\cmd\git.exe`，**不在 PATH 上**，要用完整路径：
@@ -144,8 +196,15 @@ $g = 'C:\Program Files\Git\cmd\git.exe'
 
 ```bash
 python tests/test_model_core.py         # 12/12
-python tests/test_kb_retrieval.py       # 5/5
+python tests/test_kb_retrieval.py       # 6/6
 python tools/ksr_calc.py --selfcheck    # 退出码 0
+```
+
+改过 `tools/finetune.py` 的 `encode()` 再加一件，用 `.venv-gpu` 跑（模型不在仓库里，
+找不到 tokenizer 时它自己跳过并退出 0）：
+
+```bash
+python tests/test_finetune_encode.py    # 4/4
 ```
 
 `.dl/`（下载缓存，2.4 GB）和 `work-*/`（实验产物）都在 `.gitignore` 里，不要提交。
@@ -184,6 +243,12 @@ tools/bench.py    吞吐与显存实测：--device/--dtype/--batch，--side dens
 tools/attrib.py   知识归属探针：gap_experts / gap_kb / 上界探针 / 重复权威，输出判定
 tools/play.py     演示台（命令行）：加一条知识立刻能答对（--demo 自动演示，或直接进交互模式）
 tools/webui.py    演示台（网页版）：只用标准库起服务，四个按钮 问/加/改/删，把"有没有检索"并排显示
+tools/chatui.py   真模型聊天台：Qwen3-1.7B + 工具(calc/kb_add/kb_lookup) + 思考 + 外部知识库；
+                  设 KSR_CHAT_ADAPTER 可叠 LoRA（merge_and_unload，推理路径与无 adapter 时一致）
+tools/chatbench.py 分开量两条路：模型自己调工具（tool）vs 回答前自动检索（auto），含误触发
+tools/sftdata.py   微调数据生成：查/写/不用工具/算/拒答五类，评测实体刻意不重叠
+tools/finetune.py  LoRA 微调：底座 fp16 冻结、可训练参数转 fp32；损失只算 assistant 轮——
+                  怎么框区间、踩过哪些静默的坑，见它 encode() 的文档和 tests/test_finetune_encode.py
 tools/configs/    ksr7b_32L.json（7B 定稿）、ksr7b.json（紧凑版）、四个可运行原型
 tests/            独立可跑的回归测试（不依赖 pytest）
 ```
@@ -224,6 +289,12 @@ tests/            独立可跑的回归测试（不依赖 pytest）
   结论：**"路由精准激活专家"在这台机器上不是没测好，是测不出来**——它要求两个条件同时成立
   （知识必须是算出来而非查出来的、专家要多到装不进显存），当前一个都不满足。详见
   [docs/KNOWLEDGE.md](docs/KNOWLEDGE.md)。
+- **合成数据的工具调用微调，打不过底座**：39600 条五类对话做 LoRA（可训参数 0.37%），
+  与基线同机同时段的对照是：该自己去查 4/6→3/6、该自己去写 3/3→0/3、auto 认账 6/6→1/6，
+  只有误触发 1/3→0/3 是修好的。原因定位到三条：过拟合（train 0.002 / 验证 0.094）、
+  坏的形式是输出裸 JSON（载荷学会了、`​tool_call` 包装丢了）、`【已知】` 注入格式在训练里
+  从未出现（auto 路出了分布）。还有个前提性错误：瞄准的"该写 0/3"并不存在——底座本来 3/3，
+  那个 0/3 是更早一个坏 adapter 的症状。细表见"试过的路"一节。
 - **重复权威没有消除**：`work-conflict` 上仍有 **21 条**留出端口模型不给检索就自己给了一个
   存在的、错误的服务名（R4）。冲突改写训练让它"认账"了（证据优先率 91%），所以这个错误被压住，
   但两个权威来源并存这件事本身还在：一旦检索不到，模型就会自信地答错。
