@@ -420,7 +420,7 @@ padding:12px;margin:12px 0;font-size:13px}.kbi{border-bottom:1px dashed var(--li
 写进去不用重训，权重一个字节都不动，换个进程还记得。</div>
 <div class="bar"><span>状态 <b id="st">加载中</b></span>
 <span>底座 <b id="md">—</b>（外部预训练，非本项目所训）</span>
-<span>参数 <b id="pm">—</b></span><span>知识库 <b id="kbN">—</b> 条</span>
+<span>参数 <b id="pm">—</b></span><span onclick="kbToggle()" style="cursor:pointer" title="点这里看知识库里存了什么（和下面那个「知识库」按钮是同一个）">知识库 <b id="kbN">—</b> 条 ⌄</span>
 <span>权重指纹 <b id="fp">—</b></span><span>速度 <b id="sp">—</b> tok/s</span></div>
 <div id="kb"></div><div id="log"></div>
 <div class="foot">底座是 Qwen3（0.6B 和 1.7B 都能跑，现在跑的是 1.7B）：对话没问题，
@@ -460,13 +460,17 @@ async function send(){const t=$('t').value.trim();if(!t)return;$('t').value='';
  if(r.steps&&r.steps.length)h+=tools(r.steps);
  h+=esc(r.reply||'（空）');box.innerHTML=h;
  H.push({role:'assistant',content:r.reply||''});st()}
-async function kbToggle(){$('kb').style.display='block';
- const r=await fetch('/api/kb').then(x=>x.json());
- $('kb').innerHTML='<b>知识库里的 '+r.kb_size+' 条</b>（这就是模型"记住"的东西，存在模型外面）'
+async function kbShow(){const p=$('kb');p.style.display='block';
+ p.innerHTML='<span class="spin">读取中…</span>';let r;
+ try{r=await fetch('/api/kb').then(x=>x.json())}
+ catch(e){p.innerHTML='<span style="color:var(--bad)">读不了：'+esc(e)+'（服务还在跑吗？）</span>';return}
+ if(r.error){p.innerHTML='<span style="color:var(--bad)">'+esc(r.error)+'</span>';return}
+ p.innerHTML='<b>知识库里的 '+r.kb_size+' 条</b>（这就是模型"记住"的东西，存在模型外面）'
  +(r.items.length?r.items.map(i=>`<div class="kbi">${esc(i.text)}
   <button onclick="del('${i.rid}')">删</button></div>`).join(''):'<div class="kv">（还空着。跟它说"记一下…"它就会写进来）</div>')}
+function kbToggle(){const p=$('kb');if(p.style.display=='block')p.style.display='none';else kbShow()}
 async function del(rid){await fetch('/api/kb_delete',{method:'POST',
- headers:{'Content-Type':'application/json'},body:JSON.stringify({rid})});kbToggle();st()}
+ headers:{'Content-Type':'application/json'},body:JSON.stringify({rid})});kbShow();st()}
 $('t').addEventListener('keydown',e=>{if(e.key==='Enter')send()});st();setInterval(st,5000);
 </script></body></html>"""
 
@@ -481,6 +485,8 @@ class Handler(BaseHTTPRequestHandler):
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
+        # 不缓存：这是本地开发服务，缓存只会让用户看到旧页面或旧数据。
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
